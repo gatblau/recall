@@ -270,7 +270,7 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   why: Phase 2 had to adapt the C1 spec's illustrative 2.x SurrealQL to SurrealDB 3.x — BM25 index is `FIELDS content_text FULLTEXT ANALYZER recall_text BM25` (not `SEARCH ANALYZER`) over a derived `content_text` projection; HNSW `DIMENSION` is a `<dim>` placeholder substituted from RECALL_EMBED_DIM; a `fact_ent` index was added (load-bearing for the graph leg); relationship endpoints stored as `from_ent`/`to_ent` (reserved-word clash); namespace/database DDL moved into the Migrator; `schema_migrations` created outside the numbered set. These are REALITY-DRIFT vs `docs/spec/components/memory-store.md`; reconcile via /sync-spec (code→spec) so /sync-check passes.
   source: apply-phase-2
   suggested-command: /sync-spec docs/spec/components/memory-store.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-009
   title: Unify embedded + remote Store behind one type
@@ -284,7 +284,7 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   why: Phase 3 adapted the C2 spec to 3.x — `TYPE object FLEXIBLE` (not `FLEXIBLE TYPE object`) for `work_job.payload`/`dead_letter.payload`/`dead_letter.scope`; the atomic claim's `UPDATE … LIMIT 1` became an inner `SELECT … LIMIT 1` subquery (UPDATE-level LIMIT unsupported), relying on SurrealKV optimistic-concurrency for single-winner; dedup matches `scope.tenant`/`user`/`team` sub-fields rather than whole-object equality. Also the spec's `StoreWorkQueue::new(store: Arc<dyn MemoryStore>, …)` was built over a shared `Surreal<Db>` handle (the `MemoryStore` trait exposes no raw DB handle) per the plan's instruction. REALITY-DRIFT vs `docs/spec/components/work-queue.md`; reconcile via /sync-spec so /sync-check passes.
   source: apply-phase-3
   suggested-command: /sync-spec docs/spec/components/work-queue.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-011
   title: Pin the production OIDC tenant/jti/groups claims (OQ-IDP) + Dex test-coverage note
@@ -298,35 +298,35 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   why: Phase 5 adapted the C4 spec — `quarantine.content` is `TYPE object FLEXIBLE`; `entities`/`source_id` stored as `array<string>`/`option<string>` (ids are "table:key" strings, matching C1); NFC normalisation is currently identity (documented assumption); `ExtractedFact` gained `memory_class`, `PiiSpan` gained `start`/`end`. It also DEFINED concrete provider wire contracts not previously in the spec: embed `POST /embeddings {model,input[]}→{embeddings[][]}`, LLM extract `POST /extract {content}→{facts[]}`, PII `POST /pii/scan {content}→{spans[]}`. Reconcile these into `docs/spec/components/write-pipeline.md` (and a provider-contract note) via /sync-spec so /sync-check passes.
   source: apply-phase-5
   suggested-command: /sync-spec docs/spec/components/write-pipeline.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-013
   title: Reconcile the C5 freshness spec to the as-built broker wire contract
   why: Phase 6 DEFINED the concrete Faraday-broker conditional-check wire contract the C5 spec left to the (spec-less) broker adapter — `GET {RECALL_BROKER_URL}/sources/{origin_ref}/freshness` with `If-None-Match: <modification_marker>` and `X-Recall-Tenant`/`X-Recall-User`/`X-Correlation-Id` headers; `304`->unchanged, `200`->changed, any other status->absorbed ProviderError. It also added `Debug`/`PartialEq`/`Eq` derives to `Currency` (additive, non-drifting). Reconcile the wire contract into `docs/spec/components/freshness-checker.md` (and the shared provider-contract note alongside FU-012's) via /sync-spec so /sync-check passes.
   source: apply-phase-6
   suggested-command: /sync-spec docs/spec/components/freshness-checker.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-014
   title: Reconcile the C6 retrieval spec + the recall→HNSW-KNN change + the rerank wire contract
   why: Phase 7 implemented C6 and resolved RISK-008. Spec reconciliation needed for (a) C1 — `MemoryStore::recall`'s vector signal changed from the spec's illustrative brute-force `vector::similarity::cosine(...) ORDER BY` to the HNSW KNN operator `embedding <|knn_k,ef|> $qv` + `vector::distance::knn()` with 4× over-fetch-then-filter (relates to FU-008); (b) C6 — the cursor is concretely base64url(JSON `{s,id}`), keyword tokenisation is a simple non-alphanumeric/lowercase/dedupe split feeding C1's `recall_text` BM25 analyzer, reformulation is a no-op pass-through, and `Cursor`/`RetrievalConfig`/`RecallOutcome` are the as-built types; (c) the cross-encoder rerank wire contract was DEFINED here — `POST {RECALL_RERANK_URL}/rerank {query,documents[]}→{scores[]}` (positionally aligned) — add it to the provider-contract note alongside FU-012/FU-013. Reconcile via /sync-spec so /sync-check passes.
   source: apply-phase-7
   suggested-command: /sync-spec docs/spec/components/retrieval-engine.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-015
   title: Reconcile the C7 maintenance spec to the as-built (consolidate wire contract, InsightCandidate fields, maintenance_state persistence)
   why: Phase 8 implemented C7 with three as-built decisions to reconcile into `docs/spec/components/maintenance-worker.md`/C1: (a) the LLM consolidate wire contract was DEFINED here — `POST {RECALL_LLM_URL}/consolidate {episodes:[<Fact>]}→{insights:[{content,entities,derived_from,confidence,support_count}]}` (add to the provider-contract note alongside FU-012/FU-013/FU-014); (b) `InsightCandidate` gained `entities`/`support_count` in `src/types/ports.rs` to match the C7 spec's owned type; (c) `run_scheduler`'s per-tenant `last_cycle_at` is held in-memory (not persisted) — the `maintenance_state` table (migration 0004) exists but the worker does not yet read/write it (the worker holds only the four spec deps), so cycle bookkeeping resets on restart (benign re-run). Reconcile via /sync-spec; implement maintenance_state persistence if cross-restart idle/fallback accuracy is required. blocked-by/relates-to RISK-009.
   source: apply-phase-8
   suggested-command: /sync-spec docs/spec/components/maintenance-worker.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-016
   title: Reconcile the C8 HTTP API Edge spec to the as-built implementation
   why: Phase 9 implemented C8 with several as-built decisions to reconcile into `docs/spec/components/http-api-edge.md` (and the C1 0001 migration). (a) `DELETE /v1/memories/{id}` calls `store.hard_delete` DIRECTLY (synchronous, proof-gated) instead of enqueuing a C2 HardDelete job and awaiting a proof — no job-result store exists and C7's `handle_hard_delete` itself just calls `store.hard_delete`, so this is functionally identical and preserves SA-DELETE-01; the spec's Forget sequence (enqueue+await) should be reconciled to the direct call (or a job-result store added if the async-worker ownership is required). (b) C6 returns `RecallOutcome { response, next_cursor, abstained }`, not the spec's `(RecallResponse, RecallMeta)` tuple — mapped to `Meta`. (c) OpenAPI is a hand-built `serde_json` 3.1 document, not auto-derived (SA-VER-01). (d) idempotency get/put are concrete `Store` methods (not on the `MemoryStore` trait); the idempotency_record id is a uuidv5 over (tenant,user,route,key). (e) `audit_log.scope` was changed to `TYPE object FLEXIBLE` in the C1-owned `migrations/0001_init.up.surql` so the audit-write contract works on 3.x (non-destructive; relates to FU-008). (f) `/healthz` keeps `{"data":{"status":"live"},...}` (binding boot.feature) rather than the spec's `{"status":"ok"}`. (g) rate-limit burst stays the spec-fixed 40/10 with a `TokenBucket::empty()` test seam. (h) `build_state` is now async and wires the full stack via `Store::connect` (SurrealKV at RECALL_STORE_PATH; relates to FU-009). Reconcile via /sync-spec so /sync-check passes.
   source: apply-phase-9
   suggested-command: /sync-spec docs/spec/components/http-api-edge.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-017
   title: Run the cargo-audit dependency-CVE gate (tool absent in the build env)
@@ -340,7 +340,7 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   why: The five numbered migrations (0001 init, 0002 queue, 0003 quarantine, 0004 maintenance, 0005 idempotency) were squashed into a single `migrations/0001_init.{up,down}.surql` before first release (greenfield, no shipped DB). `src/store/migrate.rs` now registers one `version: 1, slug: "init"` entry and the migration-count test asserts `LATEST = 1`. The per-component spec Data Model sections (C1/C2/C4/C7/C8) and the X7 migrations cross-cutting spec still describe separate numbered migrations — fold this into the FU-008/010/012/015/016 /sync-spec reconciliations so the specs describe one initial migration.
   source: sync-check-resolution
   suggested-command: /sync-spec docs/spec/components/memory-store.md
-  status: open
+  status: done
   added: 2026-06-21
 ```
 
