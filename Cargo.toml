@@ -1,0 +1,53 @@
+[package]
+name = "recall"
+version = "0.1.0"
+edition = "2021"
+description = "recall — agentic memory service (Phase 1 scaffolding & cross-cutting foundations)"
+license = "Apache-2.0"
+
+[lib]
+name = "recall"
+path = "src/lib.rs"
+
+[[bin]]
+name = "recall"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v7", "v5", "v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["catch-panic"] }
+http = "1"
+surrealdb = { version = "3", features = ["kv-surrealkv", "kv-mem"] }
+sha2 = "0.10"
+tokio-util = "0.7"
+rand = "0.8"
+jsonwebtoken = "10"
+base64 = "0.22.1"
+
+[[test]]
+name = "bdd"
+harness = false
+
+[dev-dependencies]
+cucumber = "0.21"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+testcontainers = "0.23"
+wiremock = "0.6"
+sha2 = "0.10"
+surrealdb = { version = "3", features = ["protocol-ws", "protocol-http", "rustls"] }
+chrono = { version = "0.4", features = ["serde"] }
+rsa = { version = "0.9.10", features = ["pem"] }
+base64 = "0.22.1"
