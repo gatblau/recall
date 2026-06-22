@@ -3,11 +3,11 @@
 **File:** `src/queue` | **Package:** `recall::queue` | **Phase:** 2 | **Dependencies:** C1 Memory Store
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.4.1
+> **derivedFromHld:** 0.5.0
 
 #### Purpose
 
-The Durable Work Queue decouples the asynchronous write and maintenance path from the synchronous request, so a slow or failed write never blocks a read (ADR-004) and every unit of background work is retry-safe. It is the single hand-off seam between producers (HTTP API Edge enqueuing `ExtractFact`/`HardDelete`, Freshness Checker enqueuing `ReReadSource`) and consumers (Write Pipeline claiming `ExtractFact`, Maintenance Worker claiming `ReEmbedFact`/`Consolidate`/`HardDelete`). It implements the `WorkQueue` trait (Phase 2C.6) plus a lease-reaper. The default backend is store-backed — a SurrealDB `work_job` table inside each tenant namespace governed by a claim/lease protocol (SA-QUEUE-01) — keeping the single-binary deployment intact; a `RECALL_QUEUE_BACKEND=nats` alternative sits behind the same trait so producers and consumers never change.
+The Durable Work Queue decouples the asynchronous write and maintenance path from the synchronous request, so a slow or failed write never blocks a read (ADR-004) and every unit of background work is retry-safe. It is the single hand-off seam between producers (HTTP API Edge enqueuing `ExtractFact`/`HardDelete`) and consumers (Write Pipeline claiming `ExtractFact`, Maintenance Worker claiming `ReEmbedFact`/`Consolidate`/`HardDelete`). It implements the `WorkQueue` trait (Phase 2C.6) plus a lease-reaper. The default backend is store-backed — a SurrealDB `work_job` table inside each tenant namespace governed by a claim/lease protocol (SA-QUEUE-01) — keeping the single-binary deployment intact; a `RECALL_QUEUE_BACKEND=nats` alternative sits behind the same trait so producers and consumers never change.
 
 #### Approach
 
@@ -36,7 +36,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, ReReadSource, Consolidate, HardDelete }
+pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

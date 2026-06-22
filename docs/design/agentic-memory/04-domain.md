@@ -1,6 +1,6 @@
 # 04 — Domain Model & Data Lifecycle
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 Field *types* are deferred to `/spec`; this section names entities, their relationships, and their
 lifecycle.
@@ -41,8 +41,9 @@ lifecycle.
 - **Key fields.** identity; origin reference (document/system handle); origin modification marker
   (for freshness); trust signal.
 - **Relationships.** Cited by one or more Facts.
-- **Lifecycle.** Recorded on write; re-checked by the Freshness Checker; never the authority for
-  access (the source system enforces that).
+- **Lifecycle.** Recorded on write; returned to the agent on request (`include_provenance`) so the
+  agent checks source freshness itself (ADR-014); never the authority for access (the source system
+  enforces that).
 
 ### Scope (Tenant → Team → User)
 - **Purpose.** The ownership/access boundary of memory, modelled as a three-level hierarchy:

@@ -1,10 +1,17 @@
 # Phase 6 — Self-Audit
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.4.1 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20
+> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
 
 This is the blocking gate that promotes the spec set from *Draft* to *Approved*. Each checklist item
 is ticked against the generated specs (Phases 1–5). **Verdict: PASS** — every item is `[x]`.
+
+**RFC 01 / ADR-014 re-audit (2026-06-22).** ADR-014 supersedes ADR-013: `recall` is a passive store,
+freshness is agent-side. C5 Freshness Checker is **retired**; the recall-side source-change check, the
+`Currency`/`FreshnessChecker`/`BrokerClient`/`SourceState` types, the `ReReadSource` job, and
+`RECALL_BROKER_URL`/`RECALL_FRESHNESS_*` are removed; `RankedFact` drops `currency` and gains a
+conditional `source` (`include_provenance`). The checklist below was re-run against the amended set
+(seven live component specs + retired C5) and still passes; the affected items are annotated.
 
 ```
 [x] Every entity has a complete data model with types and constraints.
@@ -44,20 +51,21 @@ is ticked against the generated specs (Phases 1–5). **Verdict: PASS** — ever
    ("in-process", "process boundary", and the noun "handle" in `Source.origin_ref` are not banned-verb
    usages.)
 4. **Gherkin ≥3.** Component counts: memory-store 6, work-queue 6, auth-scope 7, write-pipeline 10,
-   freshness-checker 6, retrieval-engine 7, maintenance-worker 7, http-api-edge 11. Each cross-cutting
-   spec (X1–X13) has exactly 3 (happy/edge/error). All ≥3.
+   retrieval-engine 7, maintenance-worker 7, http-api-edge 11 (C5 freshness-checker retired — ADR-014).
+   Each cross-cutting spec (X1–X13) has exactly 3 (happy/edge/error). All ≥3.
 5. **Error table ≥2.** Components: memory-store 7, work-queue 5, auth-scope 5, write-pipeline 9,
-   freshness-checker 4, retrieval-engine 6, maintenance-worker 9, http-api-edge 17. Cross-cutting specs
+   retrieval-engine 6, maintenance-worker 9, http-api-edge 17 (C5 retired). Cross-cutting specs
    that produce client/lifecycle errors carry ≥2 rows (X1, X2, X6, X7, X8, X9, X10, X12, X13). The
    pure-observability concerns **X3 Logging, X4 Metrics, X5 Tracing** and **X11 CORS (off by default)**
    record `N/A — <reason>` per the template's explicit "if a section genuinely does not apply" rule:
    they emit no client-facing error path. This is a documented, justified exception, not an omission.
 6. **Both-side interactions.** C8↔C3 (auth), C8↔C6 (recall), C8↔C2 (enqueue), C8↔C1 (GET fact + audit);
-   C6↔C1 (recall/store), C6↔C5 (freshness tag); C5↔C2 (ReReadSource enqueue); C4↔C2 (ExtractFact
+   C6↔C1 (recall/store + `get_source` for conditional provenance); C4↔C2 (ExtractFact
    consume), C4↔C1 (persist/entity/source); C7↔C2 (Consolidate/ReEmbed/HardDelete consume), C7↔C1
    (scans/mutate/hard_delete); C2↔C1 (store-backed table + `list_tenants`). Each is stated on both the
-   producing and consuming spec.
-7. **Valid DAG.** Phase 2B + Phase 5: C1 → {C2,C3} → {C4,C5} → {C6,C7} → C8, cross-cutting at Phase 0.
+   producing and consuming spec. (The C6↔C5 freshness-tag and C5↔C2 ReReadSource edges are removed — C5
+   retired by ADR-014.)
+7. **Valid DAG.** Phase 2B + Phase 5: C1 → {C2,C3} → C4 → {C6,C7} → C8, cross-cutting at Phase 0.
    Every edge points to a higher phase; the async write path means there is no synchronous C8→C4 edge.
    No cycles.
 8. **Config complete.** §2D lists every env var with Type, Default, Required, Owner, Description (50
@@ -77,27 +85,30 @@ is ticked against the generated specs (Phases 1–5). **Verdict: PASS** — ever
     `ScopeContext`, structural tenant isolation) has its security posture stated; X2/X12/X9 cover the
     edge.
 14. **Performance targets.** C1 (ANN ≤ 50 ms), C6 (p95 ≤ 200 ms with SA-LAT-01 sub-budgets), C3
-    (token validation ≤ 5 ms warm), C5 (≤ 25 ms freshness batch), C8 (edge overhead ≤ 5 ms), C2 (claim
-    p95 ≤ 20 ms). Async components (C4/C7) state off-read-path budgets.
+    (token validation ≤ 5 ms warm), C8 (edge overhead ≤ 5 ms), C2 (claim p95 ≤ 20 ms). Async components
+    (C4/C7) state off-read-path budgets. (The C5 ≤ 25 ms freshness sub-budget is gone — C5 retired,
+    ADR-014; the read path makes no freshness check.)
 15. **Locale en-GB.** All narrative prose uses en-GB spelling/idiom.
 16. **Rollback surfaced.** C1 (`0001` down path, `REMOVE NAMESPACE` erasure, schemaless→schemafull
     tightening, HNSW dimension change), X7 (migration down pairs, refused destructive down on populated
     namespaces), C8 (`idempotency_record` `REMOVE TABLE`), C7 (`maintenance_state` non-destructive drop).
-17. **derivedFromHld present.** All four phase files and all eight component files plus the 13
-    cross-cutting specs carry `derivedFromHld: 0.4.1`.
+17. **derivedFromHld present.** All six phase files, all eight component files (incl. the retired C5
+    tombstone), and the 13 cross-cutting specs carry a `derivedFromHld:` field, all now `0.5.0` after the
+    RFC-01 / ADR-014 amendment.
 18. **No hidden ADRs.** Component *Approach* sections carry only component-scope "why-this-not-that"
     (permitted by the template); no system-level Decision·Context·Consequences·Alternatives paragraph
     sits in a spec — the v1 entity-resolution trade-off was promoted to HLD `10-risks.md` + the
     `02-architecture.md` responsibility line via the Phase 3.5 HLD-impact-pass.
-19. **Glossary terms in HLD.** The two domain terms surfaced by the LLD — `stale-pending-refresh`,
-    `unverified-currency` — were promoted to the HLD glossary (D-HLD-1) in the HLD-impact-pass. The
-    remaining Phase-1 `[LLD]` terms (`Work job`, `Dead letter`, `Trust score`, `Scope partition key`)
-    are implementation-mechanism names, correctly spec-local per the bubble-up rule's
-    "implementation details masquerading as architecture" exclusion — they are not HLD domain terms.
-20. **Pins current.** Every `derivedFromHld:` equals the HLD's current `revision: 0.4.1`; no stale
-    phase (verified by scan — zero `0.4.0` pins remain).
-21. **Changelog coverage.** The HLD bump to 0.4.1 has two matching `99-changelog.md` lines (glossary
-    additions; entity-resolution clarification + risk). README and all child banners read 0.4.1
+19. **Glossary terms in HLD.** Under ADR-014 the read-path currency terms `stale-pending-refresh` and
+    `unverified-currency` were **removed** from both the HLD glossary and the spec set (no longer recall
+    concepts); the `Source provenance (response)` term the LLD now uses is spec-local (an implementation
+    mechanism, correctly not an HLD domain term per the bubble-up rule). The remaining Phase-1 `[LLD]`
+    terms (`Work job`, `Dead letter`, `Trust score`, `Scope partition key`) are implementation-mechanism
+    names, correctly spec-local — not HLD domain terms.
+20. **Pins current.** Every `derivedFromHld:` equals the HLD's current `revision: 0.5.0`; no stale
+    phase (verified by scan — zero `0.4.x` pins remain).
+21. **Changelog coverage.** The HLD bump to 0.5.0 has a matching `99-changelog.md` line (RFC 01 /
+    ADR-014: passive store, agent-side freshness). README and all child banners read 0.5.0
     (D-HLD-5 sibling consistency holds; D-HLD-6 satisfied).
 
 ## Verdict

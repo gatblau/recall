@@ -1,6 +1,6 @@
 # 06 — Regulatory and Compliance Context
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 `recall` accumulates real facts about people and organisations, so data-protection obligations apply
 even though no specific regulated sector is committed. The jurisdiction is not yet fixed (see

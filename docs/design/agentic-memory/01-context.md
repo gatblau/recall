@@ -1,6 +1,6 @@
 # 01 — System Context
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 `recall` is a network service called by the Faraday broker on behalf of an end user, backed by a
 memory store and assisted by external model providers for the asynchronous write/maintenance path.
@@ -18,8 +18,7 @@ flowchart TB
     recall -->|query embed read path +<br/>fact-content embed async, HTTPS| embed[Embedding model provider]
     recall -->|rerank top-k read path, HTTPS| rerank[Reranker<br/>cross-encoder]
     recall -->|async, off read path, HTTPS| llm[LLM provider<br/>extraction + consolidation]
-    broker -->|reads source docs as the user| sources[(Source systems / documents)]
-    recall -->|conditional source-change check<br/>read path, via broker as user| broker
+    broker -->|reads source docs + checks freshness as the user| sources[(Source systems / documents)]
 
     recall -->|logs, metrics, traces| obs[Observability stack]
 ```
@@ -30,11 +29,11 @@ flowchart TB
   indirect; never talks to `recall` directly. Identity flows through the broker.
 - **AI agent (Faraday sandbox)** — writes the short script that uses memory; runs sealed, holds no
   credentials. **Interaction:** indirect, via the broker. Treats `recall` responses as untrusted data.
-- **Faraday broker** — the trusted caller. Authenticates as the end user, injects an OIDC bearer
-  token, enforces the system allowlist and Faraday-side audit. **Interaction:** HTTPS to `recall`'s
-  API; `Authorization: Bearer <OIDC JWT>`; direction broker→`recall`, plus a re-entrant `recall`→broker
-  call for a **cheap conditional source-change check** on the read path (any actual source re-read is
-  enqueued and runs asynchronously — ADR-013; outbound shape in [08 — Interfaces](./08-interfaces.md)).
+- **Faraday broker** — the trusted caller, co-located with the agent. Authenticates as the end user,
+  injects an OIDC bearer token, enforces the system allowlist and Faraday-side audit, and reads source
+  documents / checks their freshness on the agent's behalf. **Interaction:** HTTPS to `recall`'s API;
+  `Authorization: Bearer <OIDC JWT>`; direction broker→`recall` only — `recall` makes **no** outbound
+  call to the broker (ADR-014, superseding the ADR-013 re-entrant check).
 - **OIDC Identity Provider** — issues and signs the bearer tokens the broker carries, and exposes
   discovery + JWKS endpoints `recall` uses to validate them. **Interaction:** the broker obtains
   tokens; `recall` fetches `.well-known/openid-configuration` and the JWKS over HTTPS. IdP is
@@ -57,8 +56,10 @@ flowchart TB
   `recall`→provider, HTTPS, **asynchronous only**; never invoked on the synchronous read path. This is
   the call NFR-P1 ("no LLM calls on the read path") forbids on the read path.
 - **Source systems / documents** — the documents memory is learned from and whose freshness is
-  checked. **Interaction:** read **by the broker as the user**, never by `recall` directly, so source
-  access rights are enforced by the source systems (no central master-permission store).
+  checked. **Interaction:** read and freshness-checked **by the broker/agent as the user**, never by
+  `recall` directly, so source access rights are enforced by the source systems (no central
+  master-permission store). `recall` only stores the version marker the agent supplied at write time and
+  returns it on request (ADR-014).
 - **Observability stack** — receives structured logs, metrics, and traces. **Interaction:**
   `recall`→stack, push or scrape per project default.
 

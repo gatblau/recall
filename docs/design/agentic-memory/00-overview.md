@@ -1,6 +1,6 @@
 # 00 — Overview
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 ## Summary
 
@@ -19,9 +19,10 @@ A language model is stateless: each call starts from nothing. An agent that forg
 between invocations cannot remember earlier task context, cannot carry knowledge across sessions, and
 must re-read every source document on every question. The conventional fix — pre-indexing all
 documents into a static store — goes stale, mixes versions, and creates a privacy surface. `recall`
-instead provides a memory that learns from use (the Faraday "learn-as-you-ask" model), verifies its
-own freshness, stores facts as relationships rather than text blobs, resolves contradictions over
-time, and respects the access rights of the systems it learns from. Without it, agents built on this
+instead provides a memory that learns from use (the Faraday "learn-as-you-ask" model), surfaces each
+fact's source and version so the agent can verify freshness, stores facts as relationships rather than
+text blobs, resolves contradictions over time, and respects the access rights of the systems it learns
+from. Without it, agents built on this
 stack remain amnesiac and the organisation pays the full cost of re-reading sources on every query.
 
 The full reasoning, the survey of existing systems, and the quality techniques are recorded in
@@ -74,12 +75,10 @@ The full reasoning, the survey of existing systems, and the quality techniques a
 | Confidence | How sure `recall` is that a fact is true; lower confidence decays faster. | An inferred fact starts at 0.5; a verified one at 0.95. |
 | Salience floor | A minimum-importance threshold below which time-based forgetting may not prune. | High-salience facts survive disuse. |
 | Provenance | The source and ingestion date attached to every fact, supporting citation and trust. | "from document X, ingested 2026-06-12". |
-| Freshness loop | Ask → check whether the source changed → refresh if stale → answer. | Re-reading a changed document before answering. |
+| Freshness loop | Ask → `recall` returns the note plus its source + version → the **agent** checks whether the source changed → re-reads and writes a fresh superseding note if stale. Runs at the agent, not in `recall` (ADR-014). | The agent re-reading a changed document and writing an updated note. |
 | Write gate | The trust check on the write path that may quarantine or reject untrusted content. | Rejecting an instruction-like "fact" from a booby-trapped document. |
 | Scope | The ownership/access boundary of a fact, modelled as Tenant → Team → User. | User U's facts within Tenant T. |
 | Tenant | An organisation — the hard isolation boundary; one SurrealDB namespace per tenant, no commingling. | "Acme Corp". |
 | Team | A group within a tenant that may share memory. | Acme's Platform team. |
 | Visibility | Whether a fact is private to its user, shared to a team, or shared across the tenant. | A team-shared runbook fact. |
-| Faraday broker | The trusted component that authenticates as the user and calls `recall` on their behalf. | Injects the OIDC bearer token. |
-| stale-pending-refresh | A read-path currency flag on a returned fact: its source has changed and an asynchronous re-read has been enqueued; the fact is served now and refreshed shortly. | A doc-derived fact returned while its refresh job is queued (ADR-013). |
-| unverified-currency | A read-path currency flag: the freshness check could not run (broker or source unreachable), so the stored fact is served without a currency guarantee rather than blocking. | A fact returned when the broker is down (ADR-013). |
+| Faraday broker | The trusted component that authenticates as the user and calls `recall` on their behalf; co-located with the agent, it also reads source documents and checks their freshness (never `recall`'s job — ADR-014). | Injects the OIDC bearer token; re-reads a changed document for the agent. |

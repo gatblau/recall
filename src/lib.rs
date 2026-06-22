@@ -8,7 +8,6 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
-pub mod freshness;
 pub mod maintenance;
 pub mod obs;
 pub mod providers;
@@ -30,17 +29,17 @@ use crate::api::{build_router, AppState};
 use crate::auth::{AuthConfig, Authenticator};
 use crate::config::Config;
 use crate::obs::metrics::Metrics;
-use crate::providers::{HttpBrokerClient, HttpEmbeddingClient, HttpRerankClient};
+use crate::providers::{HttpEmbeddingClient, HttpRerankClient};
 use crate::queue::StoreWorkQueue;
 use crate::retrieval::{RetrievalConfig, RetrievalEngine};
 use crate::store::Store;
-use crate::types::ports::{BrokerClient, EmbeddingClient, FreshnessChecker, MemoryStore, RerankClient};
+use crate::types::ports::{EmbeddingClient, MemoryStore, RerankClient};
 
 /// Build the full production application state from a loaded configuration: the embedded store (C1), the
-/// store-backed work queue (C2), the provider HTTP clients, the retrieval engine (C6) over a broker
-/// freshness checker (C5), and the authenticator (C3, which performs OIDC discovery + the first JWKS
-/// fetch and so fails fast if the IdP is unreachable). Registers the metric catalogue and initialises
-/// the optional tracing export seam.
+/// store-backed work queue (C2), the provider HTTP clients, the retrieval engine (C6), and the
+/// authenticator (C3, which performs OIDC discovery + the first JWKS fetch and so fails fast if the IdP
+/// is unreachable). Registers the metric catalogue and initialises the optional tracing export seam.
+/// Freshness is agent-side (ADR-014): recall holds no broker client and runs no freshness checker.
 ///
 /// DEVIATION (documented follow-up): the embedded store is opened with `Store::connect`, which uses the
 /// SurrealKV embedded engine at `RECALL_STORE_PATH`. No production "open" constructor beyond
@@ -64,24 +63,17 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         config.job_backoff_base_ms,
     ));
 
-    // Providers (C4/C5/C6 seams).
+    // Providers (C4/C6 seams).
     let embedder: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
     let reranker: Arc<dyn RerankClient> = Arc::new(HttpRerankClient::new(&config));
-    let broker: Arc<dyn BrokerClient> = Arc::new(HttpBrokerClient::new(&config));
-    let freshness: Arc<dyn FreshnessChecker> = Arc::new(crate::freshness::BrokerFreshnessChecker::new(
-        broker,
-        queue.clone(),
-        std::time::Duration::from_millis(u64::from(config.freshness_budget_ms)),
-        std::time::Duration::from_millis(u64::from(config.freshness_per_call_ms)),
-    ));
 
     // C6 — retrieval engine. `store.clone()` coerces `Arc<Store>` to `Arc<dyn MemoryStore>`.
+    // Freshness is agent-side (ADR-014): recall makes no broker call and runs no freshness checker.
     let store_dyn: Arc<dyn MemoryStore> = store.clone();
     let engine = Arc::new(RetrievalEngine::new(
         store_dyn,
         embedder,
         reranker,
-        freshness,
         RetrievalConfig::from_config(&config),
     ));
 

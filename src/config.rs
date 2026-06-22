@@ -118,8 +118,6 @@ pub struct Config {
     // --- C4/C7 llm ---
     pub llm_url: String,
     pub llm_api_key: Secret,
-    // --- C5 broker ---
-    pub broker_url: String,
     // --- C2 queue ---
     pub queue_backend: QueueBackend,
     pub queue_nats_url: Option<String>,
@@ -154,9 +152,7 @@ pub struct Config {
     pub rate_read_per_min: u32,
     pub rate_write_per_min: u32,
     pub max_body_bytes: u32,
-    // --- shared embedding model + freshness ---
-    pub freshness_budget_ms: u32,
-    pub freshness_per_call_ms: u32,
+    // --- shared embedding model ---
     pub embed_model_version: String,
     // --- observability / env (all components) ---
     pub otlp_endpoint: Option<String>,
@@ -246,7 +242,6 @@ impl Config {
         let rerank_api_key = Secret::new(src.required("RECALL_RERANK_API_KEY")?);
         let llm_url = src.required("RECALL_LLM_URL")?;
         let llm_api_key = Secret::new(src.required("RECALL_LLM_API_KEY")?);
-        let broker_url = src.required("RECALL_BROKER_URL")?;
 
         // --- C8 HTTP ---
         let http_addr_raw = src.get_or("RECALL_HTTP_ADDR", "0.0.0.0:8080");
@@ -389,15 +384,7 @@ impl Config {
         let max_body_bytes =
             parse_field("RECALL_MAX_BODY_BYTES", &src.get_or("RECALL_MAX_BODY_BYTES", "1048576"))?;
 
-        // --- freshness + embedding model ---
-        let freshness_budget_ms = parse_field(
-            "RECALL_FRESHNESS_BUDGET_MS",
-            &src.get_or("RECALL_FRESHNESS_BUDGET_MS", "25"),
-        )?;
-        let freshness_per_call_ms = parse_field(
-            "RECALL_FRESHNESS_PER_CALL_MS",
-            &src.get_or("RECALL_FRESHNESS_PER_CALL_MS", "20"),
-        )?;
+        // --- embedding model ---
         let embed_model_version =
             src.get_or("RECALL_EMBED_MODEL_VERSION", "default");
 
@@ -435,7 +422,6 @@ impl Config {
             rerank_api_key,
             llm_url,
             llm_api_key,
-            broker_url,
             queue_backend,
             queue_nats_url,
             job_max_attempts,
@@ -465,8 +451,6 @@ impl Config {
             rate_read_per_min,
             rate_write_per_min,
             max_body_bytes,
-            freshness_budget_ms,
-            freshness_per_call_ms,
             embed_model_version,
             otlp_endpoint,
             log_level,
@@ -507,7 +491,6 @@ mod tests {
             ("RECALL_RERANK_API_KEY", "secret-rerank"),
             ("RECALL_LLM_URL", "https://llm.example"),
             ("RECALL_LLM_API_KEY", "secret-llm"),
-            ("RECALL_BROKER_URL", "https://broker.example"),
         ] {
             m.insert(k.to_string(), v.to_string());
         }

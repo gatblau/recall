@@ -1,6 +1,6 @@
 # 02 — System Architecture
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 `recall` is internally split along one principal seam: a **fast synchronous read path** and a **slow
 asynchronous write/maintenance path**, sharing one hybrid store. This seam is the central
@@ -15,8 +15,7 @@ flowchart TB
     end
 
     subgraph read[Synchronous read path — LLM-free]
-        retr[Retrieval Engine<br/>query reformulation,<br/>multi-signal recall, rerank,<br/>gating, recency]
-        fresh[Freshness Checker<br/>source-change check,<br/>conditional requests]
+        retr[Retrieval Engine<br/>query reformulation,<br/>multi-signal recall, rerank,<br/>gating, recency, provenance]
     end
 
     subgraph write[Asynchronous write & maintenance path]
@@ -34,10 +33,7 @@ flowchart TB
     wpipe --> store
     maint <--> store
     retr <--> store
-    retr --> fresh
     retr -. query embed + cross-encoder rerank read path .-> ext1
-    fresh -. conditional source check read path .-> broker2[Faraday broker<br/>as user]
-    fresh -. enqueue async re-read .-> queue
     wpipe -. fact embed + extraction .-> ext1[Embedding + reranker + LLM providers]
     maint -. consolidation .-> ext1
 ```
@@ -61,16 +57,10 @@ flowchart TB
   and recency weighting, and returns ranked facts with provenance and confidence. **Query reformulation
   is optional and A/B-gated, off by default** — `good-mem.md` §7.3 reports it can underperform plain
   dense retrieval. The two read-path model inferences (query embed, rerank) carry their own latency
-  sub-budgets inside NFR-P2 (ADR-012). Owns: the read path. Depends on: Memory Store, Freshness Checker,
-  the embedding + reranker providers.
-- **Freshness Checker** — for facts whose source may have changed, performs a **cheap conditional
-  source-change check** (modification marker / `If-Modified-Since`) via the broker, as the user. This
-  check is the *only* freshness work on the read path; when it reports a change, the actual source
-  re-read and re-extraction are **enqueued and run asynchronously**, and the answer flags the fact
-  *stale-pending-refresh*. If the broker or source is unreachable, the stored fact is returned flagged
-  *unverified-currency* rather than blocking. The recall-side placement and this sync-check /
-  async-reread split are committed in ADR-013. Owns: currency verification. Depends on: the broker, the
-  work queue.
+  sub-budgets inside NFR-P2 (ADR-012). For facts that cite a source, it returns the stored provenance
+  (`origin_ref` + `modification_marker`) **on request** (a recall request parameter) so the **agent**
+  can verify freshness itself; `recall` performs no source-change check (ADR-014). Owns: the read path.
+  Depends on: Memory Store, the embedding + reranker providers.
 - **Durable work queue** — decouples ingestion and maintenance from the request, so a slow or failed
   write never blocks a read and writes are retry-safe. Owns: async hand-off. Depends on: nothing
   internal.

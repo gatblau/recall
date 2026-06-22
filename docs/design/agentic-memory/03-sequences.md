@@ -1,6 +1,6 @@
 # 03 — Principal Sequences
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 Logical order-of-operations for the four principal flows. Payload detail is deferred to `/spec`.
 
@@ -14,10 +14,8 @@ sequenceDiagram
     participant Embed as Embedding provider
     participant Store as Memory Store
     participant Rerank as Reranker (cross-encoder)
-    participant Fresh as Freshness Checker
-    participant Q as Work queue
 
-    Broker->>API: POST /v1/recall (query, filters) + OIDC bearer
+    Broker->>API: POST /v1/recall (query, filters, include_provenance) + OIDC bearer
     API->>API: validate token, map identity→scope, authorise read
     API->>Ret: scoped query
     opt reformulation A/B-gated (off by default — good-mem §7.3)
@@ -30,34 +28,23 @@ sequenceDiagram
     Ret->>Rerank: cross-encoder rerank top-k (read-path model inference, not an LLM)
     Rerank-->>Ret: reordered candidates
     Ret->>Ret: recency weighting + retrieval gating
-    Ret->>Fresh: any stale-sourced facts among top results?
-    alt source maybe-changed
-        Fresh->>Broker: conditional source-change check (If-Modified-Since, as user)
-        alt changed (re-read needed)
-            Broker-->>Fresh: changed
-            Fresh->>Q: enqueue async re-read + re-extract
-            Fresh-->>Ret: flag stale-pending-refresh
-        else unchanged / 304
-            Broker-->>Fresh: not modified
-            Fresh-->>Ret: current
-        end
-    else broker / source unreachable
-        Fresh-->>Ret: return stored fact flagged unverified-currency
+    opt provenance requested (include_provenance)
+        Ret->>Ret: attach each sourced fact's origin_ref + modification_marker
     end
     Ret-->>API: ranked facts + provenance + confidence (or abstain)
     API-->>Broker: bounded, token-efficient response
+    Note over Broker: the agent (with its local broker) checks source freshness<br/>and, if stale, writes a fresh superseding note — outside recall (ADR-014)
 ```
 
 - **Trigger:** the broker forwards a memory query on behalf of the user.
 - **Result:** a ranked, scoped set of facts, each with source and confidence — or an explicit
   "insufficient evidence" abstention. **No LLM call on this path**; two read-path **model inferences**
   (query embed, cross-encoder rerank) run here and carry their own latency sub-budgets within NFR-P2
-  (ADR-012). The freshness step is a cheap conditional check; any source re-read is asynchronous
-  (ADR-013).
+  (ADR-012). `recall` performs no source-change check; it returns each sourced fact's provenance on
+  request so the **agent** verifies freshness and writes a fresh superseding note if stale (ADR-014).
 - **Error posture:** invalid/expired token → reject (401-class); no sufficiently relevant candidate →
   abstain rather than pad; store timeout → fail fast with a typed error; embedding/reranker provider
-  timeout → degrade within the ADR-012 budget (fail fast, or skip rerank and return stage-1 order);
-  freshness-source unreachable → answer from stored fact, flagged unverified-currency.
+  timeout → degrade within the ADR-012 budget (fail fast, or skip rerank and return stage-1 order).
 
 ## Sequence: Remember (write)
 

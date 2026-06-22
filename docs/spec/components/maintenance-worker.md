@@ -2,7 +2,7 @@
 **File:** `src/maintenance` | **Package:** `recall::maintenance` | **Phase:** 4 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.4.1
+> **derivedFromHld:** 0.5.0
 
 #### Purpose
 
@@ -105,7 +105,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, ReReadSource, Consolidate, HardDelete }
+pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

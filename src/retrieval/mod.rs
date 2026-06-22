@@ -1,19 +1,21 @@
 //! C6 — Retrieval Engine. The synchronous read path of `recall` (ADR-004: no LLM call, NFR-P1).
 //!
 //! A fixed pipeline turns an authenticated, scoped [`RecallRequest`] into a bounded, ranked set of
-//! facts with provenance, confidence, a freshness flag, and an opaque pagination cursor — or an
-//! explicit abstention. It performs exactly two read-path model inferences (query embedding and a
-//! cross-encoder rerank, ADR-012/ADR-005), each with its own SA-LAT-01 sub-budget inside NFR-P2
-//! (whole-path p95 ≤ 200 ms). It owns no persistence: candidate retrieval, scope/`valid_at` filtering,
-//! and source loading are delegated to the Memory Store (C1); freshness tagging to the C5
-//! `FreshnessChecker`. This component is pure orchestration plus the ranking, gating, and cursor
-//! arithmetic.
+//! facts with confidence, an opaque pagination cursor, and — when the request opts in via
+//! `include_provenance` — each sourced fact's `origin_ref` + `modification_marker` so the agent can
+//! check source freshness itself (ADR-014) — or an explicit abstention. It performs exactly two
+//! read-path model inferences (query embedding and a cross-encoder rerank, ADR-012/ADR-005), each with
+//! its own SA-LAT-01 sub-budget inside NFR-P2 (whole-path p95 ≤ 200 ms). It owns no persistence:
+//! candidate retrieval, scope/`valid_at` filtering, and source loading are delegated to the Memory
+//! Store (C1). `recall` performs no source-change check (ADR-014). This component is pure orchestration
+//! plus the ranking, gating, and cursor arithmetic.
 //!
 //! Pipeline (`recall`): input-guard + cursor-decode → (optional reformulation) → embed → stage-1
-//! multi-signal recall → rerank → recency weight → gate/abstain → pagination window → freshness tag →
-//! build outcome. Each external step degrades per the spec rather than blocking the response: embed
-//! and stage-1 fail fast (a typed error); rerank degrades to stage-1 order; freshness degrades to
-//! `UnverifiedCurrency`. Scope is taken only from `ctx` (built by C3), never from the request body;
+//! multi-signal recall → rerank → recency weight → gate/abstain → pagination window → conditional
+//! provenance attach → build outcome. Each external step degrades per the spec rather than blocking the
+//! response: embed and stage-1 fail fast (a typed error); rerank degrades to stage-1 order; provenance
+//! attach is best-effort (a source-load miss leaves that fact's `source` unset). Scope is taken only
+//! from `ctx` (built by C3), never from the request body;
 //! tenant isolation is structural (a different tenant is a different namespace). Provider keys are
 //! env-only and never logged; fact `content` is never logged — only counts and scores.
 
@@ -26,11 +28,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::{AppError, ValidationKind};
-use crate::types::api::{Currency, RankedFact, RecallRequest, RecallResponse};
-use crate::types::domain::{Fact, Source};
+use crate::types::api::{RankedFact, RecallRequest, RecallResponse, SourceProvenance};
+use crate::types::domain::Fact;
 use crate::types::ports::{
-    EmbeddingClient, FreshnessChecker, MemoryStore, RecallFilters as StoreFilters, RerankClient,
-    StageOneQuery,
+    EmbeddingClient, MemoryStore, RecallFilters as StoreFilters, RerankClient, StageOneQuery,
 };
 use crate::types::scope::ScopeContext;
 
@@ -109,13 +110,12 @@ struct Scored {
     final_score: f64,
 }
 
-/// The synchronous read path. Holds the injected store/provider/freshness seams and the resolved
-/// config; construct once and share via `Arc`.
+/// The synchronous read path. Holds the injected store/provider seams and the resolved config;
+/// construct once and share via `Arc`. Freshness is agent-side (ADR-014): no freshness seam.
 pub struct RetrievalEngine {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn EmbeddingClient>,
     reranker: Arc<dyn RerankClient>,
-    freshness: Arc<dyn FreshnessChecker>,
     config: RetrievalConfig,
 }
 
@@ -124,14 +124,12 @@ impl RetrievalEngine {
         store: Arc<dyn MemoryStore>,
         embedder: Arc<dyn EmbeddingClient>,
         reranker: Arc<dyn RerankClient>,
-        freshness: Arc<dyn FreshnessChecker>,
         config: RetrievalConfig,
     ) -> Self {
         Self {
             store,
             embedder,
             reranker,
-            freshness,
             config,
         }
     }
@@ -298,8 +296,26 @@ impl RetrievalEngine {
         let page: Vec<Scored> = surviving_after_cursor.into_iter().take(effective_cap).collect();
         let has_more = remaining > page.len();
 
-        // Step 9 — freshness tagging (delegated to C5). Never produces an AppError.
-        let currencies = self.tag_freshness(ctx, &page).await;
+        // Step 9 — conditional provenance attach (SA-PROV-01, ADR-014). When the caller opts in,
+        // surface each sourced fact's origin_ref + modification_marker so the agent can run its own
+        // source-freshness check. Best-effort: a get_source miss/error simply omits that fact's source.
+        let mut provenance: std::collections::HashMap<String, SourceProvenance> =
+            std::collections::HashMap::new();
+        if req.include_provenance {
+            for s in &page {
+                if let Some(sid) = &s.fact.source_id {
+                    if let Ok(Some(src)) = self.store.get_source(ctx, sid).await {
+                        provenance.insert(
+                            s.fact.id.clone(),
+                            SourceProvenance {
+                                origin_ref: src.origin_ref,
+                                modification_marker: src.modification_marker,
+                            },
+                        );
+                    }
+                }
+            }
+        }
 
         // Step 10 — build the outcome.
         let next_cursor = if has_more {
@@ -317,11 +333,13 @@ impl RetrievalEngine {
         };
         let facts: Vec<RankedFact> = page
             .into_iter()
-            .zip(currencies)
-            .map(|(s, currency)| RankedFact {
-                fact: s.fact,
-                score: s.final_score.clamp(0.0, 1.0),
-                currency,
+            .map(|s| {
+                let source = provenance.remove(&s.fact.id);
+                RankedFact {
+                    fact: s.fact,
+                    score: s.final_score.clamp(0.0, 1.0),
+                    source,
+                }
             })
             .collect();
         tracing::debug!(
@@ -338,38 +356,6 @@ impl RetrievalEngine {
         })
     }
 
-    /// Step 9 — assign a `Currency` to each fact on the page, in page order. Facts with no source are
-    /// `Current`; facts whose source cannot be loaded are `UnverifiedCurrency`; the rest are checked by
-    /// C5 (which never errors and is bounded to the freshness sub-budget).
-    async fn tag_freshness(&self, ctx: &ScopeContext, page: &[Scored]) -> Vec<Currency> {
-        // Resolve the (fact, source) pairs to check, remembering each fact's page position.
-        let mut pairs: Vec<(Fact, Source)> = Vec::new();
-        // Default every fact to Current; overwrite with the checker's verdict (or UnverifiedCurrency
-        // when its source cannot be loaded).
-        let mut by_id: std::collections::HashMap<String, Currency> = std::collections::HashMap::new();
-        for s in page {
-            match &s.fact.source_id {
-                None => {
-                    by_id.insert(s.fact.id.clone(), Currency::Current);
-                }
-                Some(sid) => match self.store.get_source(ctx, sid).await {
-                    Ok(Some(src)) => pairs.push((s.fact.clone(), src)),
-                    // Source absent or unreadable: cannot verify -> UnverifiedCurrency (never block).
-                    Ok(None) | Err(_) => {
-                        by_id.insert(s.fact.id.clone(), Currency::UnverifiedCurrency);
-                    }
-                },
-            }
-        }
-        if !pairs.is_empty() {
-            for (fact_id, currency) in self.freshness.check(ctx, &pairs).await {
-                by_id.insert(fact_id, currency);
-            }
-        }
-        page.iter()
-            .map(|s| by_id.get(&s.fact.id).copied().unwrap_or(Currency::UnverifiedCurrency))
-            .collect()
-    }
 }
 
 /// Apply the SA-RECENCY-01 recency boost: `final = rerank · (1 + w·exp(−age_days/τ))`. `age_days` is

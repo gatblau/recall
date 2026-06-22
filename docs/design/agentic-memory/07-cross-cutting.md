@@ -1,6 +1,6 @@
 # 07 — Cross-cutting Concerns & NFRs
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 ## Cross-cutting Concerns
 
@@ -22,6 +22,7 @@
 | Graceful shutdown | **Applies** — drain in-flight requests, finish or re-enqueue in-flight async jobs, no work lost on restart. |
 | CORS | **Does not apply (default)** — callers are server-side (the broker), not browsers; configurable if a first-party browser client is ever added. |
 | Multi-tenancy | **Applies** — bridge model (ADR-011): namespace-per-tenant hard boundary + logical Team / User visibility within; bi-temporal facts and the vector index isolated per tenant; no cross-tenant leakage. Database-per-team is the escape hatch for teams needing physical isolation. |
+| Outbound calls / orchestration | **Constrained** — `recall` makes **no** outbound call to the broker or source systems and runs **no** agentic-workflow orchestration; freshness checking and source re-reads are the agent's responsibility (ADR-014). The only outbound calls are model-provider inferences: embedding + reranker on the read path, the extraction/consolidation LLM off it (ADR-012). |
 
 ## Non-functional Requirements
 
@@ -30,12 +31,13 @@
     read-path **model inferences**, query embedding and cross-encoder rerank, neither of which is an LLM
     call (ADR-012). Each carries an explicit latency sub-budget within NFR-P2.
   - Retrieval **p95 ≤ 200 ms** for a typical interactive query, excluding caller network time (NFR-P2),
-    inclusive of query-embed, rerank, and the cheap conditional freshness check (ADR-013).
+    inclusive of query-embed and rerank (no read-path freshness check — ADR-014).
   - Vector similarity search (ANN only, excluding query-embed) **≤ 50 ms** at target corpus size
     (NFR-P3, SHOULD).
   - Typical recall response within a **bounded token budget** (single-digit thousands, not tens of
     thousands) (NFR-P5).
-  - Extraction, consolidation, re-embedding, and source re-reads run **off the read path** (NFR-P4).
+  - Extraction, consolidation, and re-embedding run **off the read path** (NFR-P4). Source re-reads are
+    not performed by `recall` at all — they are the agent's responsibility (ADR-014).
 - **Scale.** Continuously growing fact store served without breaching NFR-P2 at the target volume
   (volume TBC — OQ-VOLUMES); **storage growth bounded** by decay/forgetting (NFR-S2); architecture
   scales single-node → distributed without a rewrite (NFR-S3).

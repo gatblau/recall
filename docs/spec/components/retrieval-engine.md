@@ -1,17 +1,17 @@
 ### SPEC: Retrieval Engine
 
-**File:** `src/retrieval` | **Package:** `recall::retrieval` | **Phase:** 4 | **Dependencies:** C1 Memory Store, C5 Freshness Checker
+**File:** `src/retrieval` | **Package:** `recall::retrieval` | **Phase:** 4 | **Dependencies:** C1 Memory Store
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.4.1
+> **derivedFromHld:** 0.5.0
 
 #### Purpose
 
-The Retrieval Engine is the synchronous read path of `recall`. Given an authenticated, scoped `RecallRequest`, it returns a bounded, ranked set of facts with provenance, confidence, freshness flag, and an opaque pagination cursor — or an explicit abstention when no candidate is relevant enough. The path makes **no LLM call** (NFR-P1) but is **not model-free**: it performs exactly two read-path model inferences — query embedding and a cross-encoder rerank (ADR-012) — each with its own latency sub-budget inside NFR-P2 (whole-path p95 ≤ 200 ms, excluding caller network time). It owns query embedding, stage-1 multi-signal recall delegation, reranking, recency weighting, retrieval gating, freshness tagging delegation, and result truncation plus cursor construction.
+The Retrieval Engine is the synchronous read path of `recall`. Given an authenticated, scoped `RecallRequest`, it returns a bounded, ranked set of facts with confidence, an opaque pagination cursor, and — when the request opts in via `include_provenance` — each sourced fact's `origin_ref` + `modification_marker` so the **agent** can verify source freshness itself (ADR-014); or an explicit abstention when no candidate is relevant enough. The path makes **no LLM call** (NFR-P1) and **no outbound source-change check** (ADR-014); it is **not model-free**: it performs exactly two read-path model inferences — query embedding and a cross-encoder rerank (ADR-012) — each with its own latency sub-budget inside NFR-P2 (whole-path p95 ≤ 200 ms, excluding caller network time). It owns query embedding, stage-1 multi-signal recall delegation, reranking, recency weighting, retrieval gating, result truncation plus cursor construction, and conditional provenance attachment.
 
 #### Approach
 
-The Internal Logic is a fixed eight-step pipeline (reformulate → embed → stage-1 recall → rerank → recency weight → gate → freshness tag → truncate + cursor), each step carrying an explicit SA-LAT-01 sub-budget and an explicit degradation rule, so a sub-budget breach degrades the result rather than blocking the response. Two-stage retrieval (cheap multi-signal recall then expensive cross-encoder rerank over a bounded set) is chosen per ADR-005 over single-stage vector search, which misses exact terms and relationships and ranks weaker. The engine owns no persistence: all candidate retrieval, scope filtering, and bi-temporal `valid_at` filtering are delegated to the Memory Store (C1) via the `MemoryStore::recall` trait method, so this component is pure orchestration plus the ranking and gating arithmetic. Query reformulation is kept off by default behind an A/B flag rather than made a fixed stage, because `good-mem.md` §7.3 reports it can underperform plain dense retrieval.
+The Internal Logic is a fixed pipeline (reformulate → embed → stage-1 recall → rerank → recency weight → gate → truncate + cursor → conditional provenance attach), each step carrying an explicit SA-LAT-01 sub-budget and an explicit degradation rule, so a sub-budget breach degrades the result rather than blocking the response. Two-stage retrieval (cheap multi-signal recall then expensive cross-encoder rerank over a bounded set) is chosen per ADR-005 over single-stage vector search, which misses exact terms and relationships and ranks weaker. The engine owns no persistence: all candidate retrieval, scope filtering, and bi-temporal `valid_at` filtering are delegated to the Memory Store (C1) via the `MemoryStore::recall` trait method, so this component is pure orchestration plus the ranking and gating arithmetic. Query reformulation is kept off by default behind an A/B flag rather than made a fixed stage, because `good-mem.md` §7.3 reports it can underperform plain dense retrieval.
 
 #### Shared Context
 
@@ -88,6 +88,8 @@ pub struct RecallRequest {
     pub result_cap: u8,                      // [1,50], default 10
     #[serde(default)]
     pub cursor: Option<String>,              // opaque, from a prior meta.next_cursor
+    #[serde(default)]
+    pub include_provenance: bool,            // opt-in: attach source origin_ref + marker (SA-PROV-01)
 }
 
 #[derive(Deserialize, Default)]
@@ -105,12 +107,18 @@ pub struct RecallResponse { pub facts: Vec<RankedFact> }   // wrapped in Success
 pub struct RankedFact {
     pub fact: Fact,
     pub score: f64,                          // final ranking score [0,1]
-    pub currency: Currency,                  // freshness flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceProvenance>,    // present only when include_provenance and fact has a source (SA-PROV-01)
 }
 
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "kebab-case")]
-pub enum Currency { Current, StalePendingRefresh, UnverifiedCurrency }
+/// Returned per sourced fact when the recall request opts in (SA-PROV-01, ADR-014). Lets the agent run
+/// its own source-freshness check; `recall` performs no check and asserts no currency.
+#[derive(Serialize)]
+pub struct SourceProvenance {
+    pub origin_ref: String,                  // document/system handle the agent resolves
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modification_marker: Option<String>, // ETag / Last-Modified token captured at write time
+}
 
 fn default_result_cap() -> u8 { 10 }
 ```
@@ -156,13 +164,8 @@ pub trait MemoryStore: Send + Sync {                 // impl: embedded SurrealDB
     async fn recall(&self, ctx: &ScopeContext, q: &StageOneQuery)
         -> Result<Vec<Candidate>, StoreError>;        // multi-signal stage-1, scope+metadata filtered
     async fn get_source(&self, ctx: &ScopeContext, id: &str)
-        -> Result<Option<Source>, StoreError>;        // load a fact's cited Source for freshness (step 9)
+        -> Result<Option<Source>, StoreError>;        // load a fact's cited Source for provenance attach (step 9)
     // ...other methods exist on the trait; C6 calls only `recall` and `get_source`.
-}
-
-#[async_trait]
-pub trait FreshnessChecker: Send + Sync {            // impl: C5 BrokerFreshnessChecker
-    async fn check(&self, ctx: &ScopeContext, facts: &[(Fact, Source)]) -> Vec<(String, Currency)>;
 }
 
 #[async_trait]
@@ -183,7 +186,7 @@ pub trait RerankClient: Send + Sync {                 // impl: HTTP adapter (rea
 - A `reqwest` timeout maps to `ProviderError::Timeout` (C6 degrades to stage-1 order, step 5); a non-2xx status to `ProviderError::Status(code)`; a transport failure to `ProviderError::Transport`; a malformed body to `ProviderError::Malformed`.
 
 ```rust
-// Source (owned by C1/§2C.2; duplicated — C6 loads it for the freshness pair in step 9)
+// Source (owned by C1/§2C.2; duplicated — C6 loads it for the provenance attach in step 9)
 pub struct Source {
     pub id: String,                          // "source:<uuidv7>"
     pub origin_ref: String,
@@ -264,18 +267,16 @@ pub struct RetrievalEngine {
     store: Arc<dyn MemoryStore>,
     embedder: Arc<dyn EmbeddingClient>,
     reranker: Arc<dyn RerankClient>,
-    freshness: Arc<dyn FreshnessChecker>,
     config: RetrievalConfig,
 }
 
 impl RetrievalEngine {
     /// Construct the engine from its injected seams and resolved config; build once and share
-    /// via `Arc`. The argument order is fixed: store, embedder, reranker, freshness, config.
+    /// via `Arc`. The argument order is fixed: store, embedder, reranker, config.
     pub fn new(
         store: Arc<dyn MemoryStore>,
         embedder: Arc<dyn EmbeddingClient>,
         reranker: Arc<dyn RerankClient>,
-        freshness: Arc<dyn FreshnessChecker>,
         config: RetrievalConfig,
     ) -> Self;
 
@@ -361,8 +362,7 @@ Successful `RecallOutcome` rendered by C8 into the success envelope:
           "derived_from": [],
           "last_recalled_at": "2026-05-30T11:00:00.000Z"
         },
-        "score": 0.88,
-        "currency": "current"
+        "score": 0.88
       }
     ]
   },
@@ -395,9 +395,9 @@ Abstention example (top final score `0.14 < RECALL_ABSTAIN_THRESHOLD`): `data` i
 
 8. **Pagination window.** Apply the decoded cursor (step 1) by dropping every surviving candidate whose `(final, fact.id)` is not strictly after `(last_score, last_id)` in the step-6 total order, then truncate the remaining list to the effective `result_cap` (step 1). If, after truncation, more surviving candidates remain than were emitted, the page is non-final. *Errors:* none. *Logged:* `page_emitted`, `page_has_more`. Budget: counts toward the ≤ 5 ms in-process overhead.
 
-9. **Freshness tagging (delegated to C5).** For the truncated page, assign each fact with `source_id == None` `Currency::Current` directly (an agent-stated fact has no source to check); for each fact with `source_id == Some(_)`, load the cited `Source` via `MemoryStore::get_source(ctx, source_id)` and pass the `(Fact, Source)` batch to `FreshnessChecker::check(ctx, &pairs)`, which assigns each a `Currency` value: `Current`, `StalePendingRefresh` (the source changed; C5 has enqueued an async re-read), or `UnverifiedCurrency` (C5 could not reach the broker/source); join the results back by `fact_id`. Sub-budget: ≤ 25 ms (conditional check; ADR-013). **Degradation: if the freshness dependency is unreachable or exceeds its sub-budget, every fact on the page is flagged `UnverifiedCurrency`** and the response is still returned (HLD 03 / ADR-013 — never block the read). The freshness step never produces an `AppError`; an inner failure becomes `UnverifiedCurrency`. *Logged:* `freshness_ms`, `currency_unverified_count`, `currency_stale_count`.
+9. **Provenance attach (conditional; ADR-014).** If `req.include_provenance` is `false` (the default), every `RankedFact.source` is `None` and this step is a no-op. If `true`, for each fact on the truncated page with `source_id == Some(id)`, load the cited `Source` via `MemoryStore::get_source(ctx, id)` and set `source = Some(SourceProvenance { origin_ref, modification_marker })`; a fact with `source_id == None` keeps `source: None`. `recall` performs **no** source-change check — the agent (with its co-located broker) verifies freshness from the returned `origin_ref` + `modification_marker`. **Degradation: best-effort** — a `get_source` miss or store error for an individual source is absorbed (that fact's `source` stays `None`); provenance never fails the read and produces no `AppError`. Budget: one bounded store read per distinct cited source, folded into store time. *Logged:* `provenance_attached_count`.
 
-10. **Build the outcome.** Map each surviving candidate to a `RankedFact { fact, score: final, currency }` with `score` clamped to `[0,1]`. Build `RecallResponse { facts }`. If `abstained` (step 7) the facts vector is empty and `next_cursor` is `None`. Otherwise, if the page is non-final (step 8), set `next_cursor = Some(Cursor { s: last_emitted_final, id: last_emitted_id }.encode())` (base64url URL-safe no-padding over the JSON encoding — see the *Data Model* cursor note); if final, `next_cursor = None`. Return `RecallOutcome { response, next_cursor, abstained }`. *Errors:* a cursor-serialisation failure is `AppError::Internal`. *Logged:* `facts_returned`, `next_cursor_present`.
+10. **Build the outcome.** Map each surviving candidate to a `RankedFact { fact, score: final, source }` (the `source` from step 9, `None` unless `include_provenance` was set) with `score` clamped to `[0,1]`. Build `RecallResponse { facts }`. If `abstained` (step 7) the facts vector is empty and `next_cursor` is `None`. Otherwise, if the page is non-final (step 8), set `next_cursor = Some(Cursor { s: last_emitted_final, id: last_emitted_id }.encode())` (base64url URL-safe no-padding over the JSON encoding — see the *Data Model* cursor note); if final, `next_cursor = None`. Return `RecallOutcome { response, next_cursor, abstained }`. *Errors:* a cursor-serialisation failure is `AppError::Internal`. *Logged:* `facts_returned`, `next_cursor_present`.
 
 #### Data Model
 
@@ -418,7 +418,7 @@ N/A — reads via `MemoryStore`, owns no tables. All persistence, indexes, and t
 | Memory Store unavailable (step 4) | 503 | STORE_UNAVAILABLE | `{"error":{"code":"STORE_UNAVAILABLE","message":"memory store unavailable","correlation_id":"<uuid>"}}` |
 | Query-vector length ≠ `RECALL_EMBED_DIM` (step 3), or cursor serialisation failure (step 10) | 500 | INTERNAL | `{"error":{"code":"INTERNAL","message":"internal error","correlation_id":"<uuid>"}}` |
 
-Note: reranker timeout (step 5) and freshness unreachability (step 9) are **not** error rows — they degrade to stage-1 order and `UnverifiedCurrency` respectively and still return `200`. C8 owns the `AppError` → status/code mapping; the codes above are the Phase 4 registry values C6's variants map to.
+Note: reranker timeout (step 5) is **not** an error row — it degrades to stage-1 order and still returns `200`. Provenance attach (step 9) is best-effort — a `get_source` miss/error leaves that fact's `source` as `None` and still returns `200`, so it is not an error row either. C8 owns the `AppError` → status/code mapping; the codes above are the Phase 4 registry values C6's variants map to.
 
 #### Acceptance Criteria (Gherkin)
 
@@ -431,7 +431,7 @@ Feature: Retrieval Engine
     And the Memory Store returns 12 candidates and the reranker scores them
     When recall is invoked
     Then the response contains at most 3 RankedFacts ordered by final score descending
-    And each RankedFact carries a fact, a score in [0,1], and a currency flag
+    And each RankedFact carries a fact and a score in [0,1]
     And meta.abstained is absent
     And a next_cursor is present when more than 3 candidates survive gating
 
@@ -452,12 +452,12 @@ Feature: Retrieval Engine
     And facts are ordered by their stage-1 semantic score
     And the rerank_skipped metric is incremented
 
-  Scenario: Edge case — freshness dependency unreachable flags unverified currency
-    Given an authenticated read scope returning candidates that clear the abstain threshold
-    And the Freshness Checker cannot reach the broker
-    When recall is invoked
-    Then the response is returned with status 200
-    And every returned fact has currency "unverified-currency"
+  Scenario: Provenance attached only when requested
+    Given an authenticated read scope returning a sourced fact that clears the gate
+    When recall is invoked with include_provenance true
+    Then each returned sourced fact carries source.origin_ref and source.modification_marker
+    When recall is invoked with include_provenance false
+    Then no returned fact carries a source object
 
   Scenario: Error path — embedding provider times out
     Given an authenticated read scope
@@ -489,17 +489,17 @@ Feature: Retrieval Engine
   | Query embed (step 3) | ≤ 60 ms | Fail fast (no query vector ⇒ no semantic recall) |
   | Stage-1 ANN recall (step 4) | ≤ 50 ms (NFR-P3) | Fail fast with typed `Store` error |
   | Cross-encoder rerank (step 5) | ≤ 60 ms | Skip rerank, return stage-1 order |
-  | Conditional freshness check (step 9) | ≤ 25 ms | Flag page `UnverifiedCurrency`, return |
+  | Provenance attach (step 9, only if `include_provenance`) | bounded store read per cited source | Best-effort; a miss/error leaves that fact's `source` `None` |
   | In-process overhead (steps 1, 2, 6, 7, 8, 10) | ≤ 5 ms | n/a (no external call) |
 
   Response stays within the bounded token budget (NFR-P5) because `result_cap ≤ RECALL_RESULT_CAP_MAX = 50`. No LLM call on this path (NFR-P1); exactly two read-path model inferences (embed, rerank) per ADR-012.
 - **Security.** The component never trusts a scope value from `req`; scope comes only from `ctx` (built by C3), which is passed to `MemoryStore::recall` so the store applies the read-filter rule (tenant isolation is structural — a different tenant is a different namespace). Cross-tenant retrieval is structurally impossible. Provider API keys (`RECALL_EMBED_API_KEY`, `RECALL_RERANK_API_KEY`) are read from env only and never logged. Fact `content` is never logged at `info` or below; only counts and scores are logged. Input is validated at the boundary (step 1). Authentication, authorisation, and rate limiting are enforced by C3/C8 before `recall` is called; C6 assumes `ctx.allowed_ops.read == true`.
-- **Observability.** Per-stage latency histograms (milliseconds): `recall_embed_ms`, `recall_stage1_ms`, `recall_rerank_ms`, `recall_freshness_ms`, `recall_total_ms` — each labelled `{tenant}`. Counters: `recall_abstain_total{tenant}` (the abstain-rate numerator; abstain rate = `recall_abstain_total / recall_total` over the metrics window), `recall_rerank_skipped_total{tenant}`, `recall_currency_unverified_total{tenant}`, `recall_currency_stale_total{tenant}`. Trace span `retrieval.recall` with child spans `retrieval.embed`, `retrieval.stage1`, `retrieval.rerank`, `retrieval.freshness`, all carrying `correlation_id` from `ctx`. Log fields per the per-step `Logged` notes; structured logs carry `correlation_id`, never fact `content` or provider keys.
+- **Observability.** Per-stage latency histograms (milliseconds): `recall_embed_ms`, `recall_stage1_ms`, `recall_rerank_ms`, `recall_total_ms` — each labelled `{tenant}`. Counters: `recall_abstain_total{tenant}` (the abstain-rate numerator; abstain rate = `recall_abstain_total / recall_total` over the metrics window), `recall_rerank_skipped_total{tenant}`, `recall_provenance_attached_total{tenant}`. Trace span `retrieval.recall` with child spans `retrieval.embed`, `retrieval.stage1`, `retrieval.rerank`, all carrying `correlation_id` from `ctx`. Log fields per the per-step `Logged` notes; structured logs carry `correlation_id`, never fact `content` or provider keys.
 
 #### Gaps
 
-None. *(Resolved in the Phase 3 reconciliation pass:*
-- *C5's read-path tagging is the canonical `FreshnessChecker` trait in Phase 2C.6 — `check(&self, ctx, facts: &[(Fact, Source)]) -> Vec<(String, Currency)>` (impl `BrokerFreshnessChecker`) — which C6 depends on by name. C6 loads each candidate's cited `Source` via `MemoryStore::get_source` and passes `(Fact, Source)` pairs; facts with `source_id == None` are tagged `Current` by C6 without calling C5.*
+None. *(Resolved in the Phase 3 reconciliation pass and the RFC-01 / ADR-014 amendment:*
+- *Freshness is agent-side (ADR-014): C6 runs no source-change check and the `FreshnessChecker`/`BrokerClient`/`Currency` types are removed. C6 instead attaches per-fact provenance on request — it loads each cited `Source` via `MemoryStore::get_source` and returns `SourceProvenance { origin_ref, modification_marker }`; facts with `source_id == None`, and `include_provenance == false`, carry no `source` object.*
 - *`StageOneQuery`/`Candidate` field sets match the authoritative C1 Memory Store spec verbatim (per-signal `semantic_score`/`keyword_score`/`graph_score`, not a single fused score).*
 - *`RECALL_REFORMULATION_ENABLED` (bool, default `false`, owner C6) is now in Phase 2D.*
 - *Keyword tokenisation follows C1's `recall_text` BM25 analyzer (class tokeniser, lowercase + ascii filters) — a documented assumption, not an open gap.)*

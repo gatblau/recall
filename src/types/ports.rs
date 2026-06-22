@@ -185,7 +185,7 @@ pub struct InsightCandidate {
 
 // --- Provider-shared error/result types (§2C.6) ---
 
-/// Shared by EmbeddingClient/RerankClient/LlmClient/BrokerClient/PiiDetector.
+/// Shared by EmbeddingClient/RerankClient/LlmClient/PiiDetector.
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {
     /// -> 504 PROVIDER_TIMEOUT.
@@ -200,13 +200,6 @@ pub enum ProviderError {
     /// -> 502 PROVIDER_ERROR.
     #[error("provider malformed: {0}")]
     Malformed(String),
-}
-
-/// BrokerClient::check_source result (C5).
-pub enum SourceState {
-    Unchanged,
-    Changed,
-    Unreachable,
 }
 
 /// A PII span returned by `PiiDetector::scan` (C4 *Public Interface*). Produced by the injected
@@ -340,19 +333,7 @@ pub trait MemoryStore: Send + Sync {
     async fn ready(&self) -> Result<(), StoreError>;
 }
 
-/// Read-path freshness tagging (impl: C5 `BrokerFreshnessChecker`). C6 depends on this trait.
-#[async_trait]
-pub trait FreshnessChecker: Send + Sync {
-    /// For each (fact, its cited Source) pair, return (fact_id, Currency). C6 supplies the resolved
-    /// Source (loaded under the caller's scope) so C5 performs no store read; facts with no source
-    /// are tagged Current by C6 and not passed here. Bounded to the SA-LAT-01 freshness sub-budget;
-    /// on broker/source unreachability returns UnverifiedCurrency, never an error.
-    async fn check(
-        &self,
-        ctx: &ScopeContext,
-        facts: &[(Fact, Source)],
-    ) -> Vec<(String, crate::types::api::Currency)>;
-}
+// FreshnessChecker removed by ADR-014 — freshness is agent-side; recall runs no read-path check.
 
 #[async_trait]
 pub trait WorkQueue: Send + Sync {
@@ -390,15 +371,7 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<Vec<InsightCandidate>, ProviderError>;
 }
 
-#[async_trait]
-pub trait BrokerClient: Send + Sync {
-    /// Unchanged | Changed | Unreachable.
-    async fn check_source(
-        &self,
-        ctx: &ScopeContext,
-        src: &Source,
-    ) -> Result<SourceState, ProviderError>;
-}
+// BrokerClient removed by ADR-014 — recall makes no outbound broker call.
 
 #[async_trait]
 pub trait PiiDetector: Send + Sync {

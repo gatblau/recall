@@ -29,7 +29,6 @@ pub fn minimal_env() -> HashMap<String, String> {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", "https://llm.test"),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", "https://broker.test"),
         // Bind to an ephemeral port; the actual bound port is read back from the listener.
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
@@ -143,7 +142,6 @@ fn boot_env(issuer: &str) -> HashMap<String, String> {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", "https://llm.test"),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", "https://broker.test"),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
         ("RECALL_EMBED_DIM", "8"),
@@ -165,24 +163,21 @@ pub async fn build_test_state(
     use std::sync::Arc;
 
     use recall::auth::{AuthConfig, Authenticator};
-    use recall::providers::{HttpBrokerClient, HttpEmbeddingClient, HttpRerankClient};
+    use recall::providers::{HttpEmbeddingClient, HttpRerankClient};
     use recall::queue::StoreWorkQueue;
     use recall::retrieval::{RetrievalConfig, RetrievalEngine};
     use recall::store::Store;
-    use recall::types::ports::{
-        BrokerClient, EmbeddingClient, FreshnessChecker, MemoryStore, RerankClient,
-    };
+    use recall::types::ports::{EmbeddingClient, MemoryStore, RerankClient};
 
     let embed_dim = config.embed_dim;
     let store = Arc::new(Store::new_in_memory(embed_dim).await.expect("in-memory store"));
     let queue = Arc::new(StoreWorkQueue::new(store.handle(), embed_dim, 5, 10));
 
-    // Provider mocks: a wiremock server playing embedding + rerank + broker. The engine config points
-    // its URLs at this server.
+    // Provider mocks: a wiremock server playing embedding + rerank. The engine config points
+    // its URLs at this server. (No broker — freshness is agent-side, ADR-014.)
     let mocks = ProviderMocks::start().await;
     mocks.mount_embed(embed_dim as usize).await;
     mocks.mount_rerank_uniform(0.9).await;
-    mocks.mount_broker_unchanged().await;
 
     // Re-derive a config whose provider URLs point at the mock server, preserving the OIDC issuer.
     let mut overrides: Map<String, String> = Map::new();
@@ -194,7 +189,6 @@ pub async fn build_test_state(
     overrides.insert("RECALL_RERANK_API_KEY".into(), "test-rerank-key".into());
     overrides.insert("RECALL_LLM_URL".into(), "https://llm.test".into());
     overrides.insert("RECALL_LLM_API_KEY".into(), "test-llm-key".into());
-    overrides.insert("RECALL_BROKER_URL".into(), mocks.base_url());
     overrides.insert("RECALL_HTTP_ADDR".into(), "127.0.0.1:0".into());
     overrides.insert("RECALL_ENV".into(), "development".into());
     overrides.insert("RECALL_EMBED_DIM".into(), embed_dim.to_string());
@@ -202,20 +196,11 @@ pub async fn build_test_state(
 
     let embedder: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&prov_config));
     let reranker: Arc<dyn RerankClient> = Arc::new(HttpRerankClient::new(&prov_config));
-    let broker: Arc<dyn BrokerClient> = Arc::new(HttpBrokerClient::new(&prov_config));
-    let freshness: Arc<dyn FreshnessChecker> =
-        Arc::new(recall::freshness::BrokerFreshnessChecker::new(
-            broker,
-            queue.clone(),
-            std::time::Duration::from_millis(25),
-            std::time::Duration::from_millis(20),
-        ));
     let store_dyn: Arc<dyn MemoryStore> = store.clone();
     let engine = Arc::new(RetrievalEngine::new(
         store_dyn,
         embedder,
         reranker,
-        freshness,
         RetrievalConfig::from_config(&prov_config),
     ));
 
@@ -398,48 +383,6 @@ impl ProviderMocks {
             .unwrap_or(0)
     }
 
-    // --- C5 Freshness Checker broker stubs (Phase 6) -----------------------------------------
-    //
-    // The Faraday broker conditional check is `GET /sources/{origin_ref}/freshness` honouring the
-    // wire contract in `src/providers/mod.rs`: `304 Not Modified` -> unchanged, `200 OK` -> changed,
-    // any other status -> a provider error C5 absorbs into UnverifiedCurrency. Each freshness scenario
-    // mounts exactly one broker behaviour, so matching on the GET method alone is unambiguous.
-
-    /// Broker reports every source unchanged (`304`).
-    pub async fn mount_broker_unchanged(&self) {
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(304))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// Broker reports every source changed (`200`).
-    pub async fn mount_broker_changed(&self) {
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// Broker is down / errors (`503`) — C5 maps this to UnverifiedCurrency.
-    pub async fn mount_broker_error(&self) {
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// Broker answers, but only after `delay_ms` — used to trip the per-call / batch deadline.
-    pub async fn mount_broker_slow(&self, delay_ms: u64) {
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(304)
-                    .set_delay(std::time::Duration::from_millis(delay_ms)),
-            )
-            .mount(&self.server)
-            .await;
-    }
-
     // --- C6 Retrieval Engine provider stubs (Phase 7) ---------------------------------------
     //
     // The read path consumes the embedding provider (query vector) and the cross-encoder reranker,
@@ -474,18 +417,5 @@ impl ProviderMocks {
             .respond_with(ResponseTemplate::new(503))
             .mount(&self.server)
             .await;
-    }
-
-    /// The number of recorded broker freshness requests (proves the per-source de-duplication).
-    pub async fn broker_call_count(&self) -> usize {
-        self.server
-            .received_requests()
-            .await
-            .map(|reqs| {
-                reqs.iter()
-                    .filter(|r| r.url.path().ends_with("/freshness"))
-                    .count()
-            })
-            .unwrap_or(0)
     }
 }

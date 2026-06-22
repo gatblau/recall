@@ -18,22 +18,21 @@ use support::{boot_minimal, BootedApp};
 use recall::auth::{can_read, AuthConfig, AuthError, Authenticator, Op, ScopeRef as AuthScopeRef};
 use recall::config::Config;
 use recall::error::{map_error, AppError, Env};
-use recall::freshness::BrokerFreshnessChecker;
 use recall::maintenance::{
     ConsolidationReport, CycleReport, DecayReport, HardDeletePayload, MaintenanceConfig,
     MaintenanceWorker, ReEmbedPayload, SupersessionReport,
 };
 use recall::providers::{
-    HttpBrokerClient, HttpEmbeddingClient, HttpLlmClient, HttpPiiDetector, HttpRerankClient,
+    HttpEmbeddingClient, HttpLlmClient, HttpPiiDetector, HttpRerankClient,
 };
 use recall::queue::StoreWorkQueue;
 use recall::retrieval::{RecallOutcome, RetrievalConfig, RetrievalEngine};
 use recall::store::Store;
-use recall::types::api::{Currency, RecallRequest};
+use recall::types::api::RecallRequest;
 use recall::types::domain::{Fact, MemoryClass, Source, Visibility};
 use recall::types::job::{JobKind, JobStatus, WorkJob};
 use recall::types::ports::{
-    BrokerClient, Candidate, EmbeddingClient, FreshnessChecker, LlmClient, MemoryStore, PiiDetector,
+    Candidate, EmbeddingClient, LlmClient, MemoryStore, PiiDetector,
     QueueError, RecallFilters, RerankClient, StageOneQuery, StoreError, WorkQueue,
 };
 use recall::types::scope::{OpSet, ScopeContext, ScopeRef};
@@ -77,14 +76,6 @@ struct RecallWorld {
     wp: Option<WpHarness>,
     wp_outcome: Option<recall::write_pipeline::WriteOutcome>,
     wp_extract_content: Option<Value>,
-    // --- C5 freshness fields ---
-    fresh: Option<FreshnessHarness>,
-    fresh_facts: Vec<(Fact, Source)>,
-    fresh_results: Vec<(String, Currency)>,
-    fresh_elapsed_ms: Option<u128>,
-    fresh_ctx_tenant: String,
-    fresh_budget_ms: u32,
-    fresh_per_call_ms: u32,
     // --- C6 retrieval fields ---
     retr: Option<RetrievalHarness>,
     retr_outcome: Option<RecallOutcome>,
@@ -259,24 +250,12 @@ struct MaintHarness {
     embed_dim: u32,
 }
 
-/// The C6 retrieval harness: a real embedded store seeded with facts, a store-backed queue for the C5
-/// freshness dependency, and a wiremock server playing the embedding, reranker, and broker providers.
+/// The C6 retrieval harness: a real embedded store seeded with facts, a store-backed queue, and a
+/// wiremock server playing the embedding and reranker providers.
 struct RetrievalHarness {
     store: Arc<Store>,
-    queue: Arc<StoreWorkQueue>,
     mocks: support::ProviderMocks,
     embed_dim: u32,
-}
-
-/// The C5 freshness harness: a wiremock server playing the Faraday broker, a store-backed C2 queue
-/// over a shared embedded SurrealDB engine, and the shared engine handle for asserting enqueued jobs.
-struct FreshnessHarness {
-    broker: Arc<HttpBrokerClient>,
-    queue: Arc<StoreWorkQueue>,
-    handle: surrealdb::Surreal<surrealdb::engine::any::Any>,
-    mocks: support::ProviderMocks,
-    // Kept alive so the backing store engine is not dropped while the queue shares its connection.
-    _store: Arc<Store>,
 }
 
 /// The assembled write-pipeline harness: a shared embedded SurrealDB engine backing the C1 store, the
@@ -331,13 +310,6 @@ impl RecallWorld {
             wp: None,
             wp_outcome: None,
             wp_extract_content: None,
-            fresh: None,
-            fresh_facts: Vec::new(),
-            fresh_results: Vec::new(),
-            fresh_elapsed_ms: None,
-            fresh_ctx_tenant: "acme".to_string(),
-            fresh_budget_ms: 25,
-            fresh_per_call_ms: 20,
             retr: None,
             retr_outcome: None,
             retr_err: None,
@@ -386,7 +358,6 @@ fn parse_kind(k: &str) -> JobKind {
     match k {
         "extract_fact" => JobKind::ExtractFact,
         "re_embed_fact" => JobKind::ReEmbedFact,
-        "re_read_source" => JobKind::ReReadSource,
         "consolidate" => JobKind::Consolidate,
         "hard_delete" => JobKind::HardDelete,
         other => panic!("unknown job kind {other}"),
@@ -1459,7 +1430,6 @@ fn wp_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", base_url),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", "https://broker.test"),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -1818,262 +1788,26 @@ async fn then_wp_entities(world: &mut RecallWorld, n: usize) {
     assert!(entities >= n, "expected >= {n} entities, got {entities}");
 }
 
-// --- C5 Freshness Checker steps --------------------------------------------------------------
-
-impl FreshnessHarness {
-    /// Count `re_read_source` jobs currently in a tenant's `work_job` table (read from the shared
-    /// engine the C2 queue writes to). A scenario that enqueues nothing never provisions the tenant
-    /// namespace, so a missing `work_job` table is treated as zero rather than an error.
-    async fn count_reread_jobs(&self, tenant: &str) -> u64 {
-        self.handle
-            .use_ns(tenant.to_string())
-            .use_db("recall")
-            .await
-            .expect("use ns/db");
-        let mut resp = match self
-            .handle
-            .query("SELECT count() AS c FROM work_job WHERE kind = 're_read_source' GROUP ALL")
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return 0,
-        };
-        let rows: Vec<Value> = resp.take(0).unwrap_or_default();
-        rows.first()
-            .and_then(|r| r.get("c"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    }
-
-    /// Whether a `re_read_source` job with the given idempotency key exists in a tenant. A missing
-    /// `work_job` table (nothing was enqueued) counts as "no such job".
-    async fn reread_job_with_key_exists(&self, tenant: &str, key: &str) -> bool {
-        self.handle
-            .use_ns(tenant.to_string())
-            .use_db("recall")
-            .await
-            .expect("use ns/db");
-        let mut resp = match self
-            .handle
-            .query(
-                "SELECT count() AS c FROM work_job \
-                 WHERE kind = 're_read_source' AND idempotency_key = $k GROUP ALL",
-            )
-            .bind(("k", key.to_string()))
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        let rows: Vec<Value> = resp.take(0).unwrap_or_default();
-        rows.first()
-            .and_then(|r| r.get("c"))
-            .and_then(|v| v.as_u64())
-            .map(|c| c >= 1)
-            .unwrap_or(false)
-    }
-}
-
-/// Build a `Config` whose broker URL points at the wiremock server; other keys take defaults.
-fn fresh_config(broker_base: &str) -> Config {
-    use std::collections::HashMap;
-    let mut m = HashMap::new();
-    for (k, v) in [
-        ("RECALL_OIDC_ISSUER", "https://issuer.test"),
-        ("RECALL_OIDC_AUDIENCE", "recall"),
-        ("RECALL_EMBED_URL", "https://embed.test"),
-        ("RECALL_EMBED_API_KEY", "test-embed-key"),
-        ("RECALL_RERANK_URL", "https://rerank.test"),
-        ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", "https://llm.test"),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", broker_base),
-    ] {
-        m.insert(k.to_string(), v.to_string());
-    }
-    support::config_from_map(&m)
-}
-
-fn fresh(world: &RecallWorld) -> &FreshnessHarness {
-    world.fresh.as_ref().expect("freshness harness built in a Given")
-}
-
-/// Build a candidate `(Fact, Source)` pair for the freshness scenarios. The source carries the given
-/// modification marker; the fact cites it.
-fn make_fresh_pair(fact_id: &str, source_id: &str, marker: &str) -> (Fact, Source) {
-    let mut f = make_fact(fact_id, "acme", "none", "u-42", Visibility::UserPrivate);
-    f.source_id = Some(source_id.to_string());
-    let src = Source {
-        id: source_id.to_string(),
-        origin_ref: format!("origin-of-{source_id}"),
-        modification_marker: Some(marker.to_string()),
-        trust_signal: 0.9,
-        owner: ScopeRef {
-            tenant: "acme".into(),
-            team: None,
-            user: "u-42".into(),
-        },
-    };
-    (f, src)
-}
-
-#[given(regex = r#"^an embedded freshness checker with budget (\d+) ms and per-call (\d+) ms$"#)]
-async fn given_fresh_checker(world: &mut RecallWorld, budget_ms: u32, per_call_ms: u32) {
-    let dim = 8u32;
-    let store = Store::new_in_memory(dim).await.expect("in-memory store");
-    let handle = store.handle();
-    let queue = StoreWorkQueue::new(store.handle(), dim, 5, 10);
-    let mocks = support::ProviderMocks::start().await;
-    let config = fresh_config(&mocks.base_url());
-    let broker = Arc::new(HttpBrokerClient::new(&config));
-    world.fresh = Some(FreshnessHarness {
-        broker,
-        queue: Arc::new(queue),
-        handle,
-        mocks,
-        _store: Arc::new(store),
-    });
-    world.fresh_budget_ms = budget_ms;
-    world.fresh_per_call_ms = per_call_ms;
-    world.fresh_facts.clear();
-    world.fresh_results.clear();
-    world.fresh_ctx_tenant = "acme".to_string();
-}
-
-#[given("the broker reports the source unchanged")]
-async fn given_broker_unchanged(world: &mut RecallWorld) {
-    fresh(world).mocks.mount_broker_unchanged().await;
-}
-
-#[given("the broker reports the source changed")]
-async fn given_broker_changed(world: &mut RecallWorld) {
-    fresh(world).mocks.mount_broker_changed().await;
-}
-
-#[given("the broker returns an error")]
-async fn given_broker_error(world: &mut RecallWorld) {
-    fresh(world).mocks.mount_broker_error().await;
-}
-
-#[given("the broker is slow beyond the batch budget")]
-async fn given_broker_slow(world: &mut RecallWorld) {
-    // Sleep well past the budget so both the per-call timeout and the batch deadline trip.
-    fresh(world).mocks.mount_broker_slow(200).await;
-}
-
-#[given("the work queue is unwritable")]
-async fn given_queue_unwritable(world: &mut RecallWorld) {
-    // A space is not a valid namespace identifier, so the store-backed enqueue is rejected before any
-    // statement runs (the same QUEUE_UNAVAILABLE class a lost connection produces).
-    world.fresh_ctx_tenant = "bad tenant".to_string();
-}
-
-#[given(
-    regex = r#"^a candidate fact "([^"]+)" citing source "([^"]+)" with marker "([^"]+)"$"#
-)]
-async fn given_fresh_fact(world: &mut RecallWorld, fact_id: String, source_id: String, marker: String) {
-    world
-        .fresh_facts
-        .push(make_fresh_pair(&fact_id, &source_id, &marker));
-}
-
-#[when("the freshness check runs")]
-async fn when_fresh_check(world: &mut RecallWorld) {
-    let harness = fresh(world);
-    let broker: Arc<dyn BrokerClient> = harness.broker.clone();
-    let queue: Arc<dyn WorkQueue> = harness.queue.clone();
-    let checker = BrokerFreshnessChecker::new(
-        broker,
-        queue,
-        Duration::from_millis(world.fresh_budget_ms as u64),
-        Duration::from_millis(world.fresh_per_call_ms as u64),
-    );
-    let ctx = test_ctx(&world.fresh_ctx_tenant, "u-42", "none");
-    let facts = world.fresh_facts.clone();
-    let start = std::time::Instant::now();
-    let results = checker.check(&ctx, &facts).await;
-    world.fresh_elapsed_ms = Some(start.elapsed().as_millis());
-    world.fresh_results = results;
-}
-
-fn currency_str(c: Currency) -> &'static str {
-    match c {
-        Currency::Current => "current",
-        Currency::StalePendingRefresh => "stale-pending-refresh",
-        Currency::UnverifiedCurrency => "unverified-currency",
-    }
-}
-
-#[then(regex = r#"^fact "([^"]+)" has currency "([^"]+)"$"#)]
-async fn then_fresh_currency(world: &mut RecallWorld, fact_id: String, expected: String) {
-    let got = world
-        .fresh_results
-        .iter()
-        .find(|(id, _)| *id == fact_id)
-        .map(|(_, c)| currency_str(*c))
-        .unwrap_or_else(|| panic!("no result for {fact_id}; got {:?}", world.fresh_results));
-    assert_eq!(got, expected, "currency mismatch for {fact_id}");
-}
-
-#[then(regex = r#"^no re-read job is enqueued for tenant "([^"]+)"$"#)]
-async fn then_fresh_no_job(world: &mut RecallWorld, tenant: String) {
-    let c = fresh(world).count_reread_jobs(&tenant).await;
-    assert_eq!(c, 0, "expected no re-read jobs");
-}
-
-#[then(regex = r#"^exactly (\d+) re-read job(?:s)? (?:is|are) enqueued for tenant "([^"]+)"$"#)]
-async fn then_fresh_job_count(world: &mut RecallWorld, n: u64, tenant: String) {
-    let c = fresh(world).count_reread_jobs(&tenant).await;
-    assert_eq!(c, n, "re-read job count mismatch");
-}
-
-#[then(regex = r#"^exactly (\d+) broker check(?:s)? (?:was|were) made$"#)]
-async fn then_fresh_broker_calls(world: &mut RecallWorld, n: usize) {
-    let c = fresh(world).mocks.broker_call_count().await;
-    assert_eq!(c, n, "broker call count mismatch");
-}
-
-#[then(regex = r#"^a re-read job exists with key "([^"]+)" for tenant "([^"]+)"$"#)]
-async fn then_fresh_job_key(world: &mut RecallWorld, key: String, tenant: String) {
-    assert!(
-        fresh(world).reread_job_with_key_exists(&tenant, &key).await,
-        "expected a re-read job with key {key}"
-    );
-}
-
-#[then(regex = r#"^the batch returned within (\d+) ms$"#)]
-async fn then_fresh_within(world: &mut RecallWorld, ms: u128) {
-    let elapsed = world.fresh_elapsed_ms.expect("a recorded elapsed time");
-    assert!(elapsed <= ms, "batch took {elapsed} ms, expected <= {ms} ms");
-}
-
 // --- C6 Retrieval Engine steps ---------------------------------------------------------------
 
 impl RetrievalHarness {
-    /// Assemble a `RetrievalEngine` over this harness's store/queue and the wiremock-backed providers
-    /// (embedding, reranker, broker). Built per invocation so the latest mounts are in effect.
+    /// Assemble a `RetrievalEngine` over this harness's store and the wiremock-backed providers
+    /// (embedding, reranker). Built per invocation so the latest mounts are in effect.
     fn engine(&self) -> RetrievalEngine {
         let config = retr_config(&self.mocks.base_url(), self.embed_dim);
         let embedder: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
         let reranker: Arc<dyn RerankClient> = Arc::new(HttpRerankClient::new(&config));
-        let broker: Arc<dyn BrokerClient> = Arc::new(HttpBrokerClient::new(&config));
-        let freshness: Arc<dyn FreshnessChecker> = Arc::new(BrokerFreshnessChecker::new(
-            broker,
-            self.queue.clone(),
-            Duration::from_millis(25),
-            Duration::from_millis(20),
-        ));
+        let store_dyn: Arc<dyn MemoryStore> = self.store.clone();
         RetrievalEngine::new(
-            self.store.clone(),
+            store_dyn,
             embedder,
             reranker,
-            freshness,
             RetrievalConfig::from_config(&config),
         )
     }
 }
 
-/// Build a `Config` whose embedding/rerank/broker URLs all point at the wiremock server (distinct
+/// Build a `Config` whose embedding/rerank URLs all point at the wiremock server (distinct
 /// paths) and whose embed dim is the harness dim; other keys take their defaults.
 fn retr_config(base_url: &str, embed_dim: u32) -> Config {
     use std::collections::HashMap;
@@ -2087,7 +1821,6 @@ fn retr_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", "https://llm.test"),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", base_url),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -2111,17 +1844,16 @@ fn make_recall_req(query: &str, result_cap: u8, cursor: Option<String>) -> Recal
         filters: recall::types::api::RecallFilters::default(),
         result_cap,
         cursor,
+        include_provenance: false,
     }
 }
 
 #[given(regex = r#"^a retrieval engine over an embedded store with embedding dimension (\d+)$"#)]
 async fn given_retr_engine(world: &mut RecallWorld, dim: u32) {
     let store = Store::new_in_memory(dim).await.expect("in-memory store");
-    let queue = StoreWorkQueue::new(store.handle(), dim, 5, 10);
     let mocks = support::ProviderMocks::start().await;
     world.retr = Some(RetrievalHarness {
         store: Arc::new(store),
-        queue: Arc::new(queue),
         mocks,
         embed_dim: dim,
     });
@@ -2149,11 +1881,6 @@ async fn given_retr_rerank(world: &mut RecallWorld, score: f64) {
 #[given("the reranker errors")]
 async fn given_retr_rerank_error(world: &mut RecallWorld) {
     retr(world).mocks.mount_rerank_error().await;
-}
-
-#[given("the broker is unreachable")]
-async fn given_retr_broker_unreachable(world: &mut RecallWorld) {
-    retr(world).mocks.mount_broker_error().await;
 }
 
 #[given(
@@ -2229,10 +1956,50 @@ async fn when_retr_recall(world: &mut RecallWorld, query: String, result_cap: u8
     }
 }
 
+#[when(
+    regex = r#"^recall is invoked with query "([^"]+)" and result_cap (\d+) with provenance$"#
+)]
+async fn when_retr_recall_provenance(world: &mut RecallWorld, query: String, result_cap: u8) {
+    let engine = retr(world).engine();
+    let mut req = make_recall_req(&query, result_cap, None);
+    req.include_provenance = true;
+    match engine.recall(&retr_ctx(), &req).await {
+        Ok(outcome) => {
+            world.retr_outcome = Some(outcome);
+            world.retr_err = None;
+        }
+        Err(e) => {
+            world.retr_err = Some(e);
+            world.retr_outcome = None;
+        }
+    }
+}
+
 fn retr_outcome(world: &RecallWorld) -> &RecallOutcome {
     world.retr_outcome.as_ref().unwrap_or_else(|| {
         panic!("expected a RecallOutcome, got error {:?}", world.retr_err)
     })
+}
+
+#[then("every returned fact carries source provenance")]
+async fn then_retr_provenance_present(world: &mut RecallWorld) {
+    let facts = &retr_outcome(world).response.facts;
+    assert!(!facts.is_empty(), "expected facts to assert provenance on");
+    for rf in facts {
+        let prov = rf.source.as_ref().unwrap_or_else(|| {
+            panic!("expected source provenance on fact {}", rf.fact.id)
+        });
+        assert!(!prov.origin_ref.is_empty(), "expected a non-empty origin_ref");
+    }
+}
+
+#[then("no returned fact carries source provenance")]
+async fn then_retr_provenance_absent(world: &mut RecallWorld) {
+    let facts = &retr_outcome(world).response.facts;
+    assert!(!facts.is_empty(), "expected facts to assert provenance absence on");
+    for rf in facts {
+        assert!(rf.source.is_none(), "expected no source object on fact {}", rf.fact.id);
+    }
 }
 
 #[then(regex = r#"^the response returns at most (\d+) facts$"#)]
@@ -2242,12 +2009,10 @@ async fn then_retr_at_most(world: &mut RecallWorld, n: usize) {
     assert!(!facts.is_empty(), "expected a non-empty page");
 }
 
-#[then("each returned fact has a score in range and a currency")]
-async fn then_retr_score_currency(world: &mut RecallWorld) {
+#[then("each returned fact has a score in range")]
+async fn then_retr_score_in_range(world: &mut RecallWorld) {
     for rf in &retr_outcome(world).response.facts {
         assert!((0.0..=1.0).contains(&rf.score), "score out of range: {}", rf.score);
-        // currency is one of the three variants by construction; touch it to prove it is set.
-        let _ = rf.currency;
     }
 }
 
@@ -2284,15 +2049,6 @@ async fn then_retr_abstains(world: &mut RecallWorld) {
 async fn then_retr_succeeds(world: &mut RecallWorld) {
     let o = retr_outcome(world);
     assert!(!o.response.facts.is_empty(), "degraded recall should still return facts");
-}
-
-#[then(regex = r#"^every returned fact has currency "([^"]+)"$"#)]
-async fn then_retr_currency_all(world: &mut RecallWorld, expected: String) {
-    let facts = &retr_outcome(world).response.facts;
-    assert!(!facts.is_empty(), "expected facts to assert currency on");
-    for rf in facts {
-        assert_eq!(currency_str(rf.currency), expected, "currency mismatch");
-    }
 }
 
 #[then(regex = r#"^recall fails with status (\d+) and code "([^"]+)"$"#)]
@@ -2426,7 +2182,6 @@ fn maint_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", base_url),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", "https://broker.test"),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -2745,15 +2500,14 @@ async fn then_maint_reembed_fails(world: &mut RecallWorld, code: String) {
 async fn build_api_harness(world: &mut RecallWorld, index_dim: u32, config_dim: u32) {
     use recall::api::{build_router, AppState};
     use recall::auth::{AuthConfig, Authenticator};
-    use recall::providers::{HttpBrokerClient, HttpEmbeddingClient, HttpRerankClient};
+    use recall::providers::{HttpEmbeddingClient, HttpRerankClient};
 
     let issuer = Arc::new(LocalIssuer::start().await);
 
-    // Provider mocks: embedding (query vector), reranker, broker.
+    // Provider mocks: embedding (query vector), reranker.
     let mocks = support::ProviderMocks::start().await;
     mocks.mount_embed(config_dim as usize).await;
     mocks.mount_rerank_uniform(0.9).await;
-    mocks.mount_broker_unchanged().await;
 
     // Store opened with the *index* dimension; config carries the *config* dimension.
     let store = Arc::new(Store::new_in_memory(index_dim).await.expect("in-memory store"));
@@ -2771,7 +2525,6 @@ async fn build_api_harness(world: &mut RecallWorld, index_dim: u32, config_dim: 
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", "https://llm.test"),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", &mocks.base_url()),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
     ] {
@@ -2782,19 +2535,11 @@ async fn build_api_harness(world: &mut RecallWorld, index_dim: u32, config_dim: 
 
     let embedder: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
     let reranker: Arc<dyn RerankClient> = Arc::new(HttpRerankClient::new(&config));
-    let broker: Arc<dyn BrokerClient> = Arc::new(HttpBrokerClient::new(&config));
-    let freshness: Arc<dyn FreshnessChecker> = Arc::new(BrokerFreshnessChecker::new(
-        broker,
-        queue.clone(),
-        Duration::from_millis(25),
-        Duration::from_millis(20),
-    ));
     let store_dyn: Arc<dyn MemoryStore> = store.clone();
     let engine = Arc::new(RetrievalEngine::new(
         store_dyn,
         embedder,
         reranker,
-        freshness,
         RetrievalConfig::from_config(&config),
     ));
     let auth = Arc::new(
@@ -3125,27 +2870,21 @@ fn sys(world: &RecallWorld) -> &SystemHarness {
     world.sys.as_ref().expect("system harness built in a Given")
 }
 
-/// Assemble the full stack over one shared engine and serve the edge on an ephemeral port. The broker
-/// behaviour (`unchanged` => 304, `changed` => 200) selects the freshness branch a recall will observe.
-async fn build_system_harness(world: &mut RecallWorld, broker_changed: bool) {
+/// Assemble the full stack over one shared engine and serve the edge on an ephemeral port.
+async fn build_system_harness(world: &mut RecallWorld) {
     use recall::api::{build_router, AppState};
     use recall::auth::{AuthConfig, Authenticator};
 
     let dim = 8u32;
     let issuer = Arc::new(LocalIssuer::start().await);
 
-    // One wiremock server plays every provider: embedding (write + read), reranker (read), broker
-    // (read freshness), extract + pii (write pipeline). Mounting all up front is unambiguous — each is
-    // matched on a distinct path (or, for the broker, the GET method).
+    // One wiremock server plays every provider: embedding (write + read), reranker (read),
+    // extract + pii (write pipeline). Mounting all up front is unambiguous — each is matched on a
+    // distinct path.
     let mocks = support::ProviderMocks::start().await;
     mocks.mount_embed(dim as usize).await;
     mocks.mount_rerank_uniform(0.9).await;
     mocks.mount_pii_none().await;
-    if broker_changed {
-        mocks.mount_broker_changed().await;
-    } else {
-        mocks.mount_broker_unchanged().await;
-    }
     let mocks_base_url = mocks.base_url();
 
     // One shared in-memory engine: the store, its handle, and a store-backed queue over that handle.
@@ -3164,7 +2903,6 @@ async fn build_system_harness(world: &mut RecallWorld, broker_changed: bool) {
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
         ("RECALL_LLM_URL", &mocks_base_url),
         ("RECALL_LLM_API_KEY", "test-llm-key"),
-        ("RECALL_BROKER_URL", &mocks_base_url),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
     ] {
@@ -3175,19 +2913,11 @@ async fn build_system_harness(world: &mut RecallWorld, broker_changed: bool) {
 
     let embedder: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
     let reranker: Arc<dyn RerankClient> = Arc::new(HttpRerankClient::new(&config));
-    let broker: Arc<dyn BrokerClient> = Arc::new(HttpBrokerClient::new(&config));
-    let freshness: Arc<dyn FreshnessChecker> = Arc::new(BrokerFreshnessChecker::new(
-        broker,
-        queue.clone(),
-        Duration::from_millis(25),
-        Duration::from_millis(20),
-    ));
     let store_dyn: Arc<dyn MemoryStore> = store.clone();
     let engine = Arc::new(RetrievalEngine::new(
         store_dyn,
         embedder,
         reranker,
-        freshness,
         RetrievalConfig::from_config(&config),
     ));
     let auth = Arc::new(
@@ -3241,22 +2971,13 @@ async fn build_system_harness(world: &mut RecallWorld, broker_changed: bool) {
     world.sys_recall_fact_ids.clear();
 }
 
-#[given(
-    regex = r#"^a system stack for tenant "([^"]+)" with the broker reporting sources unchanged$"#
-)]
+#[given(regex = r#"^a system stack for tenant "([^"]+)"$"#)]
 async fn given_system_unchanged(world: &mut RecallWorld, _tenant: String) {
-    build_system_harness(world, false).await;
-}
-
-#[given(
-    regex = r#"^a system stack for tenant "([^"]+)" with the broker reporting sources changed$"#
-)]
-async fn given_system_changed(world: &mut RecallWorld, _tenant: String) {
-    build_system_harness(world, true).await;
+    build_system_harness(world).await;
 }
 
 /// Mount the extract stub returning a fact whose `text` matches the recall query keyword. No source is
-/// attached, so the persisted fact has no `source_id` and the read-path freshness check is skipped.
+/// attached, so the persisted fact has no `source_id`.
 #[given(
     regex = r#"^the extractor will return a fact matching "([^"]+)" for the recall query$"#
 )]
@@ -3270,8 +2991,8 @@ async fn given_system_extract(world: &mut RecallWorld, keyword: String) {
     sys(world).mocks_extract(content).await;
 }
 
-/// Mount the extract stub returning a fact that CITES a source, so the read-path freshness check runs
-/// the broker and the returned fact carries a non-`current` currency when the broker reports a change.
+/// Mount the extract stub returning a fact that CITES a source, so the persisted fact carries a
+/// `source_id` linking it to the seeded source.
 #[given(
     regex = r#"^the extractor will return a sourced fact matching "([^"]+)" for the recall query$"#
 )]
@@ -3474,6 +3195,108 @@ async fn when_system_delete(world: &mut RecallWorld, key: String) {
     sys_capture(world, resp).await;
 }
 
+#[when(
+    regex = r#"^the client writes an agent-stated memory citing "([^"]+)" with marker "([^"]+)" and content (.+)$"#
+)]
+async fn when_system_write_agent_stated(
+    world: &mut RecallWorld,
+    origin_ref: String,
+    marker: String,
+    content: String,
+) {
+    let url = format!("{}/v1/memories", sys(world).base_url);
+    let content_json: Value = serde_json::from_str(&content).expect("scenario content json");
+    let body = serde_json::json!({
+        "content": content_json,
+        "source": { "origin_ref": origin_ref, "modification_marker": marker },
+        "agent_stated": true
+    });
+    // A unique Idempotency-Key per (ref, marker) so distinct writes never dedupe.
+    let idem_key = format!("agent-{origin_ref}-{marker}");
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .header("idempotency-key", idem_key);
+    if let Some(token) = &world.sys_token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.expect("send agent-stated system write");
+    sys_capture(world, resp).await;
+}
+
+#[when(regex = r#"^the client recalls "([^"]+)" with result_cap (\d+) and provenance$"#)]
+async fn when_system_recall_provenance(world: &mut RecallWorld, query: String, result_cap: u8) {
+    let url = format!("{}/v1/recall", sys(world).base_url);
+    let body = serde_json::json!({
+        "query": query,
+        "result_cap": result_cap,
+        "include_provenance": true
+    });
+    let mut req = reqwest::Client::new().post(&url).json(&body);
+    if let Some(token) = &world.sys_token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.expect("send system recall with provenance");
+    sys_capture(world, resp).await;
+    // Record the returned fact ids so a later DELETE can target one.
+    world.sys_recall_fact_ids = world
+        .sys_body
+        .as_ref()
+        .and_then(|b| b.get("data"))
+        .and_then(|d| d.get("facts"))
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|rf| rf.get("fact").and_then(|f| f.get("id")).and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+}
+
+#[then(
+    regex = r#"^every recalled system fact carries source provenance with marker "([^"]+)"$"#
+)]
+async fn then_system_facts_have_provenance(world: &mut RecallWorld, marker: String) {
+    let facts = sys_recall_facts(world);
+    assert!(
+        !facts.is_empty(),
+        "expected at least one recalled fact carrying provenance; body = {:?}",
+        world.sys_body
+    );
+    for fact in &facts {
+        let origin = fact
+            .get("source")
+            .and_then(|s| s.get("origin_ref"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !origin.is_empty(),
+            "recalled fact missing non-empty source.origin_ref; fact = {fact:?}"
+        );
+        let got_marker = fact
+            .get("source")
+            .and_then(|s| s.get("modification_marker"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            got_marker, marker,
+            "recalled fact source.modification_marker mismatch; fact = {fact:?}"
+        );
+    }
+}
+
+#[then("no recalled system fact carries source provenance")]
+async fn then_system_facts_have_no_provenance(world: &mut RecallWorld) {
+    let facts = sys_recall_facts(world);
+    for fact in &facts {
+        assert!(
+            fact.get("source").is_none(),
+            "recalled fact unexpectedly carries source provenance; fact = {fact:?}"
+        );
+    }
+}
+
 #[then(regex = r#"^the system edge status is (\d+)$"#)]
 async fn then_system_status(world: &mut RecallWorld, expected: u16) {
     assert_eq!(
@@ -3519,16 +3342,6 @@ async fn then_system_recall_at_least(world: &mut RecallWorld, n: usize) {
         "expected >= {n} recalled facts, got {got}; body = {:?}",
         world.sys_body
     );
-}
-
-#[then(regex = r#"^every recalled system fact has currency "([^"]+)"$"#)]
-async fn then_system_currency_all(world: &mut RecallWorld, expected: String) {
-    let facts = sys_recall_facts(world);
-    assert!(!facts.is_empty(), "expected recalled facts to assert currency on");
-    for rf in &facts {
-        let got = rf.get("currency").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(got, expected, "currency mismatch; fact = {rf:?}");
-    }
 }
 
 /// The recalled facts array from the captured recall response body, or empty.

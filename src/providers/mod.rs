@@ -5,11 +5,11 @@
 //! the trait surface. Phase 5 (C4 Write Pipeline) implements the wire bodies for the three providers
 //! the write pipeline consumes — `EmbeddingClient::embed`, `LlmClient::extract`,
 //! `PiiDetector::scan` — as real `reqwest` POST calls with concrete, documented JSON request/response
-//! shapes (these ARE the wire contract the integration-suite wiremock stubs honour). Phase 6 (C5
-//! Freshness Checker) wires `BrokerClient::check_source` (the Faraday broker conditional check); Phase 7
+//! shapes (these ARE the wire contract the integration-suite wiremock stubs honour). Phase 7
 //! (C6 Retrieval Engine) wires `RerankClient::rerank` (the cross-encoder); Phase 8 (C7 Maintenance
 //! Worker) wires `LlmClient::consolidate` (episodic->semantic consolidation). Every provider is now
-//! wired — none remains a skeleton.
+//! wired — none remains a skeleton. (The Faraday broker adapter was removed by ADR-014 — freshness is
+//! agent-side; recall makes no outbound broker call.)
 //!
 //! ## Wire contracts (the JSON shapes the wiremock stubs honour)
 //!
@@ -51,11 +51,6 @@
 //!           mapped onto [`InsightCandidate`]; the worker validates each against its sources before
 //!           promotion (C7).
 //!
-//! ### Broker freshness — `GET {RECALL_BROKER_URL}/sources/{origin_ref}/freshness`
-//! Headers:  `If-None-Match: <modification_marker>` (when set), `X-Recall-Tenant`, `X-Recall-User`,
-//!           `X-Correlation-Id` (the broker authorises the user; `recall` sends no source content).
-//! Response: `304 Not Modified` -> source unchanged; `200 OK` -> source changed; any other status is a
-//!           `ProviderError::Status`. The check carries no fact content — only the modification marker.
 
 use std::time::Duration;
 
@@ -65,12 +60,11 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::Config;
-use crate::types::domain::{Fact, MemoryClass, Source};
+use crate::types::domain::{Fact, MemoryClass};
 use crate::types::ports::{
-    BrokerClient, EmbeddingClient, EntityMention, ExtractedFact, InsightCandidate, LlmClient,
-    PiiDetector, PiiSpan, ProviderError, RerankClient, SourceState,
+    EmbeddingClient, EntityMention, ExtractedFact, InsightCandidate, LlmClient, PiiDetector, PiiSpan,
+    ProviderError, RerankClient,
 };
-use crate::types::scope::ScopeContext;
 
 /// Default per-call timeout for a provider HTTP request. Each external call carries its own timeout
 /// (C4 Performance note) so the per-job budget is bounded even when a provider hangs.
@@ -358,60 +352,7 @@ impl LlmClient for HttpLlmClient {
     }
 }
 
-/// HTTP adapter for the Faraday broker conditional source check (C5).
-#[allow(dead_code)]
-pub struct HttpBrokerClient {
-    client: Client,
-    base_url: String,
-}
-
-impl HttpBrokerClient {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            client: build_client(DEFAULT_TIMEOUT),
-            base_url: config.broker_url.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl BrokerClient for HttpBrokerClient {
-    /// Issue one conditional source-change check against the Faraday broker, as the authenticated user.
-    ///
-    /// `GET {RECALL_BROKER_URL}/sources/{origin_ref}/freshness` with the source's `modification_marker`
-    /// (if any) as an `If-None-Match` precondition and the caller's identity in `X-Recall-Tenant` /
-    /// `X-Recall-User` / `X-Correlation-Id` headers (the broker enforces the user's source access
-    /// rights; `recall` holds no source credentials and reads no source content). A `304 Not Modified`
-    /// means the source is unchanged; `200 OK` means it changed since the marker; any other status is a
-    /// `ProviderError::Status`. A transport failure / timeout maps via [`map_reqwest_err`]. C5 absorbs
-    /// every error and per-call timeout into `Currency::UnverifiedCurrency`, so this never blocks a read.
-    async fn check_source(
-        &self,
-        ctx: &ScopeContext,
-        src: &Source,
-    ) -> Result<SourceState, ProviderError> {
-        let url = format!(
-            "{}/sources/{}/freshness",
-            self.base_url.trim_end_matches('/'),
-            src.origin_ref
-        );
-        let mut req = self
-            .client
-            .get(&url)
-            .header("X-Recall-Tenant", &ctx.tenant)
-            .header("X-Recall-User", &ctx.user)
-            .header("X-Correlation-Id", &ctx.correlation_id);
-        if let Some(marker) = src.modification_marker.as_deref() {
-            req = req.header("If-None-Match", marker);
-        }
-        let resp = req.send().await.map_err(|e| map_reqwest_err("broker", e))?;
-        match resp.status().as_u16() {
-            304 => Ok(SourceState::Unchanged),
-            200 => Ok(SourceState::Changed),
-            other => Err(ProviderError::Status(other)),
-        }
-    }
-}
+// HttpBrokerClient removed by ADR-014 — recall makes no outbound broker call; freshness is agent-side.
 
 /// PII detector adapter (C4). Model/heuristic adapter; HTTP-backed. There is no dedicated PII config
 /// key in §2D, so the detector POSTs to the LLM provider base URL under a `/pii/scan` path with the

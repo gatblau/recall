@@ -1,7 +1,7 @@
 # Phase 2 — Architecture Artefacts
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.4.1 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20
+> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
 
 ## Table of contents
 
@@ -35,7 +35,6 @@ flowchart TB
         api["HTTP API Edge<br/>src/api"]
         auth["Auth & Scope<br/>src/auth"]
         retr["Retrieval Engine<br/>src/retrieval"]
-        fresh["Freshness Checker<br/>src/freshness"]
         queue["Durable Work Queue<br/>src/queue"]
         wpipe["Write Pipeline<br/>src/write_pipeline"]
         maint["Maintenance Worker<br/>src/maintenance"]
@@ -49,11 +48,8 @@ flowchart TB
     api -->|in-proc, enqueue job| queue
     api -->|in-proc, read fact by id| store
     retr -->|in-proc| store
-    retr -->|in-proc| fresh
     retr -->|HTTPS + provider API key, query embed| embed
     retr -->|HTTPS + provider API key, rerank top-k| rerank
-    fresh -->|HTTPS conditional check, If-Modified-Since, as user via broker| broker
-    fresh -->|in-proc, enqueue async re-read| queue
     queue -->|in-proc, claim job| wpipe
     queue -->|in-proc, claim job| maint
     wpipe -->|in-proc, persist| store
@@ -83,8 +79,8 @@ lower-numbered phases). `Complexity`: S/M/L/XL relative effort.
 | C2 | **Durable Work Queue** (`src/queue`) | infrastructure | 2 | C1 | M |
 | C3 | **Auth & Scope** (`src/auth`) | service-component | 2 | none (shared types only) | L |
 | C4 | **Write Pipeline** (`src/write_pipeline`) | service-component | 3 | C1, C2 | XL |
-| C5 | **Freshness Checker** (`src/freshness`) | service-component | 3 | C2 | M |
-| C6 | **Retrieval Engine** (`src/retrieval`) | service-component | 4 | C1, C5 | XL |
+| ~~C5~~ | ~~**Freshness Checker**~~ | — | — | — | **Retired by ADR-014** — freshness is agent-side; `recall` performs no source-change check. The id `C5` is retired (not reused) to keep C6/C7/C8 stable. |
+| C6 | **Retrieval Engine** (`src/retrieval`) | service-component | 4 | C1 | XL |
 | C7 | **Maintenance Worker** (`src/maintenance`) | service-component | 4 | C1, C2 | XL |
 | C8 | **HTTP API Edge** (`src/api`) | service-component | 5 | C1, C2, C3, C6 | L |
 
@@ -93,19 +89,19 @@ lower-numbered phases). `Complexity`: S/M/L/XL relative effort.
 ```
 C1 Memory Store
  ├─> C2 Work Queue ─┐
- │                  ├─> C4 Write Pipeline ─┐
- │                  ├─> C5 Freshness ──────┼─> C6 Retrieval ─┐
- │                  └─> C7 Maintenance     │                 │
- ├──────────────────────────────────────> C6 (store)        │
- └──────────────────────────────────────> C8 (store)        │
-C3 Auth & Scope ─────────────────────────────────────────> C8 HTTP API Edge
+ │                  ├─> C4 Write Pipeline
+ │                  └─> C7 Maintenance
+ ├──────────────────────────────────────> C6 Retrieval ─┐
+ └──────────────────────────────────────> C8 (store)    │
+C3 Auth & Scope ─────────────────────────────────────> C8 HTTP API Edge
 ```
 
-No cycles: every edge points from a lower phase to a higher one. The HTTP API Edge (C8) reaches the
-Write Pipeline only indirectly, by enqueuing on C2 — the write path is asynchronous (ADR-004), so
-there is no synchronous C8→C4 edge.
+No cycles: every edge points from a lower phase to a higher one. C6 Retrieval depends only on C1
+(C5 Freshness Checker is retired — ADR-014). The HTTP API Edge (C8) reaches the Write Pipeline only
+indirectly, by enqueuing on C2 — the write path is asynchronous (ADR-004), so there is no synchronous
+C8→C4 edge.
 
-**External provider adapters** (`EmbeddingClient`, `RerankClient`, `LlmClient`, `BrokerClient`,
+**External provider adapters** (`EmbeddingClient`, `RerankClient`, `LlmClient`,
 `PiiDetector`) are not separate components — they are trait abstractions defined in 2C and injected
 into the components that use them. They live under `src/providers/` as thin HTTP adapters and carry no
 domain logic, so they need no standalone Phase 3 spec; their contracts are the traits in 2C.
@@ -284,6 +280,8 @@ pub struct RecallRequest {
     pub result_cap: u8,                      // [1,50], default 10 (SA-CAP-01)
     #[serde(default)]
     pub cursor: Option<String>,              // opaque, from a prior meta.next_cursor
+    #[serde(default)]
+    pub include_provenance: bool,            // opt-in: attach source origin_ref + marker (SA-PROV-01)
 }
 
 #[derive(Deserialize, Default)]
@@ -301,12 +299,18 @@ pub struct RecallResponse { pub facts: Vec<RankedFact> }   // wrapped in Success
 pub struct RankedFact {
     pub fact: Fact,
     pub score: f64,                          // final ranking score [0,1]
-    pub currency: Currency,                  // freshness flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceProvenance>,    // present only when include_provenance and fact has a source (SA-PROV-01)
 }
 
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "kebab-case")]
-pub enum Currency { Current, StalePendingRefresh, UnverifiedCurrency }  // (1C glossary)
+/// Returned per sourced fact when the recall request opts in (SA-PROV-01, ADR-014). Lets the agent
+/// run its own source-freshness check; `recall` performs no check and asserts no currency.
+#[derive(Serialize)]
+pub struct SourceProvenance {
+    pub origin_ref: String,                  // document/system handle the agent resolves
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modification_marker: Option<String>, // ETag / Last-Modified token captured at write time
+}
 
 #[derive(Deserialize)]
 pub struct RememberRequest {
@@ -365,16 +369,15 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, ReReadSource, Consolidate, HardDelete }
+pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus { Pending, Leased, Done, DeadLetter }
 ```
 
-**Used by:** C2 (owns the table + claim/lease), C4 (consumes `ExtractFact`), C5 (produces
-`ReReadSource`), C7 (consumes `ReEmbedFact`/`Consolidate`/`HardDelete`), C8 (produces `ExtractFact`,
-`HardDelete`).
+**Used by:** C2 (owns the table + claim/lease), C4 (consumes `ExtractFact`), C7 (consumes
+`ReEmbedFact`/`Consolidate`/`HardDelete`), C8 (produces `ExtractFact`, `HardDelete`).
 
 ### 2C.6 — Provider & infrastructure traits (dependency-injected)
 
@@ -425,15 +428,7 @@ pub trait MemoryStore: Send + Sync {                 // impl: embedded SurrealDB
     async fn ready(&self) -> Result<(), StoreError>;   // connection live + vector-index dim == RECALL_EMBED_DIM
 }
 
-// Read-path freshness tagging (impl: C5 `BrokerFreshnessChecker`). C6 depends on this trait.
-#[async_trait]
-pub trait FreshnessChecker: Send + Sync {
-    /// For each (fact, its cited Source) pair, return (fact_id, Currency). C6 supplies the resolved
-    /// Source (loaded under the caller's scope) so C5 performs no store read; facts with no source
-    /// are tagged Current by C6 and not passed here. Bounded to the SA-LAT-01 freshness sub-budget;
-    /// on broker/source unreachability returns UnverifiedCurrency, never an error.
-    async fn check(&self, ctx: &ScopeContext, facts: &[(Fact, Source)]) -> Vec<(String, Currency)>;
-}
+// (Freshness tagging removed by ADR-014 — `recall` performs no source-change check; the agent does.)
 
 #[async_trait]
 pub trait WorkQueue: Send + Sync {                    // impl: store-backed (C2)
@@ -460,11 +455,7 @@ pub trait LlmClient: Send + Sync {                    // impl: HTTP adapter (asy
     async fn consolidate(&self, episodes: &[Fact]) -> Result<Vec<InsightCandidate>, ProviderError>;
 }
 
-#[async_trait]
-pub trait BrokerClient: Send + Sync {                 // impl: HTTP adapter (freshness)
-    async fn check_source(&self, ctx: &ScopeContext, src: &Source)
-        -> Result<SourceState, ProviderError>;        // Unchanged | Changed | Unreachable
-}
+// (BrokerClient removed by ADR-014 — `recall` makes no outbound broker call.)
 
 #[async_trait]
 pub trait PiiDetector: Send + Sync {                  // impl: model/heuristic adapter
@@ -479,14 +470,12 @@ home), so all adapters share them:
 // src/types/ports.rs (continued)
 
 #[derive(thiserror::Error, Debug)]
-pub enum ProviderError {                  // shared by EmbeddingClient/RerankClient/LlmClient/BrokerClient/PiiDetector
+pub enum ProviderError {                  // shared by EmbeddingClient/RerankClient/LlmClient/PiiDetector
     #[error("provider timeout")]          Timeout,            // -> 504 PROVIDER_TIMEOUT
     #[error("provider status {0}")]       Status(u16),        // -> 502 PROVIDER_ERROR
     #[error("provider transport: {0}")]   Transport(String),  // -> 502 PROVIDER_ERROR
     #[error("provider malformed: {0}")]   Malformed(String),  // -> 502 PROVIDER_ERROR
 }
-
-pub enum SourceState { Unchanged, Changed, Unreachable }   // BrokerClient::check_source result (C5)
 
 pub struct PiiSpan {                       // PiiDetector::scan result (C4)
     pub json_pointer: String,              // RFC 6901 pointer into `content`
@@ -495,7 +484,7 @@ pub struct PiiSpan {                       // PiiDetector::scan result (C4)
 }
 ```
 
-**Used by:** the trait is the contract; each consuming component spec (C1/C2/C4/C5/C6/C7) duplicates
+**Used by:** the trait is the contract; each consuming component spec (C1/C2/C4/C6/C7) duplicates
 the exact signatures it depends on into its Shared Context. `StoreError` and the C1-owned
 `Candidate`/`StageOneQuery`/`AuditEntry` are defined in full in the **C1 Memory Store** spec;
 `QueueError` in **C2**; `ExtractedFact`/`EntityMention` in **C4**; `InsightCandidate` in **C7** — each
@@ -558,7 +547,6 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_RERANK_API_KEY` | secret | _(none)_ | **yes** | C6 | Reranker key (env only). |
 | `RECALL_LLM_URL` | url | _(none)_ | **yes** | C4/C7 | Extraction/consolidation LLM endpoint (async path only). |
 | `RECALL_LLM_API_KEY` | secret | _(none)_ | **yes** | C4/C7 | LLM key (env only). |
-| `RECALL_BROKER_URL` | url | _(none)_ | **yes** | C5 | Faraday broker base URL for conditional source checks. |
 | `RECALL_QUEUE_BACKEND` | enum `store\|nats` | `store` | no | C2 | Work-queue backend (SA-QUEUE-01). |
 | `RECALL_QUEUE_NATS_URL` | url | _(unset)_ | conditional | C2 | Required iff `RECALL_QUEUE_BACKEND=nats`. |
 | `RECALL_JOB_MAX_ATTEMPTS` | u32 | `5` | no | C2 | Retry cap before dead-letter (SA-QUEUE-02). |
@@ -586,8 +574,6 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_ENV` | enum | `production` | no | all | `production\|development`; gates verbose error detail off in production. |
 | `RECALL_QUEUE_REAPER_SECS` | u32 | `30` | no | C2 | Lease-reaper sweep cadence; expired leases revert to Pending (SA-QUEUE-02). |
 | `RECALL_QUEUE_POLL_MS` | u32 | `500` | no | C2 | Worker empty-claim poll interval (back-off between idle claims). |
-| `RECALL_FRESHNESS_BUDGET_MS` | u32 | `25` | no | C5 | Read-path freshness batch deadline (SA-LAT-01). |
-| `RECALL_FRESHNESS_PER_CALL_MS` | u32 | `20` | no | C5 | Per-source conditional-check timeout. |
 | `RECALL_REFORMULATION_ENABLED` | bool | `false` | no | C6 | A/B query-reformulation flag; off by default (good-mem §7.3, ADR-012). |
 | `RECALL_EMBED_MODEL_VERSION` | string | `default` | no | C4/C6/C7 | Active embedding-model version tag; the C7 re-embed scan keys on it (SA-EMBED-01). |
 | `RECALL_MAINT_BATCH_SIZE` | u32 | `500` | no | C7 | Per-duty maintenance scan bound; keeps a cycle off the read-path store budget. |

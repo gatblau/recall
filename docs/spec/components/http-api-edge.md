@@ -2,7 +2,7 @@
 **File:** `src/api` | **Package:** `recall::api` | **Phase:** 5 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue), C3 (Auth & Scope), C6 (Retrieval Engine)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.4.1
+> **derivedFromHld:** 0.5.0
 
 #### Purpose
 
@@ -85,6 +85,7 @@ pub struct RecallRequest {
     #[serde(default)] pub filters: RecallFilters,
     #[serde(default = "default_result_cap")] pub result_cap: u8, // [1,50], default 10 (SA-CAP-01)
     #[serde(default)] pub cursor: Option<String>,               // opaque, from a prior meta.next_cursor
+    #[serde(default)] pub include_provenance: bool,             // opt-in: attach source origin_ref + marker (SA-PROV-01)
 }
 
 #[derive(Deserialize, Default)]
@@ -97,11 +98,17 @@ pub struct RecallFilters {
 
 #[derive(Serialize)] pub struct RecallResponse { pub facts: Vec<RankedFact> }
 
-#[derive(Serialize)] pub struct RankedFact { pub fact: Fact, pub score: f64, pub currency: Currency }
+#[derive(Serialize)] pub struct RankedFact {
+    pub fact: Fact,
+    pub score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")] pub source: Option<SourceProvenance>, // only when include_provenance (SA-PROV-01)
+}
 
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "kebab-case")]
-pub enum Currency { Current, StalePendingRefresh, UnverifiedCurrency }
+#[derive(Serialize)]
+pub struct SourceProvenance {
+    pub origin_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub modification_marker: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub struct RememberRequest {
@@ -154,7 +161,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, ReReadSource, Consolidate, HardDelete }
+pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -231,7 +238,7 @@ Each route below states method + path + request schema + response schema + statu
 
 **`GET /v1`** — capabilities. Request: no body. Response `200`: `Success<Capabilities>` where `Capabilities { service: String, version: String, operations: Vec<String>, openapi: String }` (`openapi` is the absolute URL of `/openapi.json`). Errors: `401` (missing/invalid token), `429`.
 
-**`POST /v1/recall`** — read. Request body: `RecallRequest`. Calls C6 `recall`. Response `200`: `Success<RecallResponse>` with `meta.abstained` set when C6 gated out all candidates and `meta.next_cursor` set when more results exist. Errors: `400` `VAL_INVALID_BODY` / `VAL_OUT_OF_RANGE` / `VAL_UNSUPPORTED_CLASS`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `502`/`504` (provider), `503`/`504` (store).
+**`POST /v1/recall`** — read. Request body: `RecallRequest` (including the optional `include_provenance` flag, passed through to C6). Calls C6 `recall`. Response `200`: `Success<RecallResponse>` with `meta.abstained` set when C6 gated out all candidates and `meta.next_cursor` set when more results exist; each returned fact carries a `source` object only when `include_provenance` was set and the fact has a source (ADR-014). Errors: `400` `VAL_INVALID_BODY` / `VAL_OUT_OF_RANGE` / `VAL_UNSUPPORTED_CLASS`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `502`/`504` (provider), `503`/`504` (store).
 
 **`POST /v1/memories`** — write (async, ADR-004). Headers: `Idempotency-Key` (required, 1–255 chars). Request body: `RememberRequest`. Enqueues an `ExtractFact` `WorkJob` on C2. Response `202`: `Success<WriteAck>` with `status = Accepted` (first submission) or `status = AlreadyAccepted` (replay within the idempotency window). Errors: `400` `VAL_INVALID_BODY` / `VAL_MISSING_IDEMPOTENCY_KEY`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `503` `QUEUE_UNAVAILABLE`.
 
@@ -293,8 +300,7 @@ RateLimit-Reset: 41
           "derived_from": [],
           "last_recalled_at": "2026-06-19T11:22:00.000Z"
         },
-        "score": 0.87,
-        "currency": "current"
+        "score": 0.87
       }
     ]
   },
@@ -334,7 +340,7 @@ The middleware chain is a fixed `tower` layer stack on the `axum` `Router`. Laye
 
 6. **Dispatch to the handler.** Each handler is thin:
    - `GET /v1` builds `Capabilities` from compile-time constants and config; returns `200`.
-   - `POST /v1/recall` deserialises `RecallRequest` (rejecting a malformed body with `400 VAL_INVALID_BODY`; `result_cap` outside `[1,50]` with `400 VAL_OUT_OF_RANGE`; a filter `memory_class` of `procedural` with `400 VAL_UNSUPPORTED_CLASS`), calls C6 `recall(ctx, req)`, maps `RecallOutcome { response, next_cursor, abstained }` into the body (`data: outcome.response`) and `Meta` (`next_cursor`, `abstained: outcome.abstained.then_some(true)`), returns `200 Success<RecallResponse>`. Provider/store failures from C6 surface as `AppError::Provider`/`AppError::Store`.
+   - `POST /v1/recall` deserialises `RecallRequest` (rejecting a malformed body with `400 VAL_INVALID_BODY`; `result_cap` outside `[1,50]` with `400 VAL_OUT_OF_RANGE`; a filter `memory_class` of `procedural` with `400 VAL_UNSUPPORTED_CLASS`), calls C6 `recall(ctx, req)` (the `include_provenance` flag rides along in `req`; C6 attaches each sourced fact's `source` when set), maps `RecallOutcome { response, next_cursor, abstained }` into the body (`data: outcome.response`) and `Meta` (`next_cursor`, `abstained: outcome.abstained.then_some(true)`), returns `200 Success<RecallResponse>`. Provider/store failures from C6 surface as `AppError::Provider`/`AppError::Store`.
    - `POST /v1/memories` deserialises `RememberRequest`, constructs a `WorkJob { kind: ExtractFact, payload: <request as JSON>, scope: ScopeRef::from(ctx), idempotency_key: Some(key) }`, calls C2 `enqueue`, returns `202 Success<WriteAck { job_id, status: Accepted }>`. A queue failure is `AppError::Queue` → `503 QUEUE_UNAVAILABLE`.
    - `GET /v1/memories/{id}` calls C1 `get_fact(ctx, id)`; `Ok(None)` → `404 NOT_FOUND`; `Ok(Some(fact))` → compute the ETag, honour `If-None-Match`/`If-Modified-Since` (→ `304`), else return `200 Success<Fact>` with the `ETag` header.
    - `POST /v1/memories/{id}/retire` calls C1 `end_validity(ctx, id, now)`; a store "not found / not owned" maps to `404 NOT_FOUND`; success → `200 Success<RetireAck>`.

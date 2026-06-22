@@ -1,6 +1,6 @@
 # 05 — Tech Stack
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 Committed defaults below are the starting position; the materially contested ones are recorded as ADRs
 (see [09 — Decisions](./09-decisions.md)) and open questions (see [10 — Risks](./10-risks.md) and the

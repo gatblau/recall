@@ -1,6 +1,6 @@
 # 09 — Architectural Decisions, Assumptions & Open Questions
 
-> **Mode:** draft · **Revision:** 0.4.1 · **Last updated:** 2026-06-20
+> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
 
 ## Architectural Decisions
 
@@ -184,6 +184,7 @@
   response is returned defeats its purpose).
 
 ### ADR-013: Freshness check is recall-side and conditional on the read path; re-read is asynchronous
+> **Superseded by ADR-014 (2026-06-22).** The recall-side check assumed a centrally-reachable broker; the broker is in fact a per-agent local component, so freshness moves to the agent.
 - **Decision.** The freshness loop runs **recall-side**. On the read path `recall` performs only a
   **cheap conditional source-change check** (modification marker / `If-Modified-Since`) by calling the
   broker **as the user**; if the source changed, the actual **re-read and re-extraction are enqueued
@@ -202,6 +203,29 @@
   blows NFR-P2). Broker-side freshness (rejected as default — pushes orchestration back onto the agent
   the API is meant to keep simple; still available as a deployment variant). No freshness check
   (rejected — returns confidently stale facts).
+
+### ADR-014: Recall is a passive memory store — freshness and orchestration are agent-side (supersedes ADR-013)
+- **Decision.** `recall` performs **no read-path source-change check, computes no currency verdict, makes
+  no outbound broker call, and enqueues no re-read job.** On recall it returns each fact's stored
+  provenance (`origin_ref` + `modification_marker`) **conditionally**, gated by a request parameter, so
+  the agent — which is co-located with its broker and holds document access — runs the
+  ask → check → update loop itself. The UPDATE leg uses the existing write/supersede endpoints.
+  **Supersedes ADR-013.**
+- **Context.** ADR-013 placed the freshness check inside `recall`, assuming a centrally-reachable broker.
+  In the real deployment the broker is a **per-agent local component** (e.g. Copilot in VS Code on a
+  developer's machine); a central `recall` cannot reach it (no routable address, behind NAT, alive only
+  while the IDE runs). The recall-side check is therefore unreachable and would degrade every fact to
+  *unverified-currency*. ADR-013 itself named the agent-driven approach as the deployment variant; this
+  deployment makes it the only viable one.
+- **Consequences.** `recall` has no outbound dependency for freshness. Removed: the C5 Freshness Checker,
+  the `BrokerClient` port + `HttpBrokerClient` adapter, the `RECALL_BROKER_URL` config, the `ReReadSource`
+  job kind, and the `currency` field on the recall response. Added: conditional source provenance on the
+  recall (and get-fact) responses. Reads are no longer "eventually-fresh via recall" — freshness is the
+  agent's responsibility. The embedding and reranker read-path inferences are retained (model inferences,
+  not orchestration).
+- **Alternatives considered.** Keep ADR-013 recall-side check (rejected — unreachable broker). Keep it
+  behind a deployment flag (rejected per the directive — `recall` makes no broker calls). Have the broker
+  call `recall` to push freshness (rejected — inverts the topology and re-adds orchestration to `recall`).
 
 ## Assumptions
 

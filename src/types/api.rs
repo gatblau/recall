@@ -19,6 +19,10 @@ pub struct RecallRequest {
     /// Opaque, from a prior meta.next_cursor.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Opt-in: attach each sourced fact's `origin_ref` + `modification_marker` so the agent can
+    /// check source freshness itself (SA-PROV-01, ADR-014). Default false keeps the response lean.
+    #[serde(default)]
+    pub include_provenance: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -42,17 +46,21 @@ pub struct RankedFact {
     pub fact: Fact,
     /// Final ranking score [0,1].
     pub score: f64,
-    /// Freshness flag.
-    pub currency: Currency,
+    /// Present only when the request set `include_provenance` and the fact cites a source
+    /// (SA-PROV-01, ADR-014). Lets the agent run its own source-freshness check; recall asserts no
+    /// freshness verdict of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceProvenance>,
 }
 
-/// (1C glossary).
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum Currency {
-    Current,
-    StalePendingRefresh,
-    UnverifiedCurrency,
+/// Returned per sourced fact when `include_provenance` is set (SA-PROV-01, ADR-014).
+#[derive(Serialize)]
+pub struct SourceProvenance {
+    /// Document/system handle the agent resolves.
+    pub origin_ref: String,
+    /// ETag / Last-Modified token captured at write time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modification_marker: Option<String>,
 }
 
 #[derive(Deserialize)]
