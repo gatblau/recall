@@ -32,7 +32,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
-use surrealdb::engine::local::Db;
+use surrealdb::engine::any::Any;
 use surrealdb::types::{Datetime, Object, Value};
 use surrealdb::Surreal;
 use tokio_util::sync::CancellationToken;
@@ -169,7 +169,7 @@ pub struct WritePipeline {
     /// Shared SurrealDB handle for the C4-owned `quarantine` table (mirrors how C2 writes its tables
     /// over `Store::handle()`); `None` when no quarantine sink is wired (the gate then rejects rather
     /// than quarantines mid-band content, which is surfaced as a defended error path).
-    db: Option<Surreal<Db>>,
+    db: Option<Surreal<Any>>,
     cfg: WritePipelineConfig,
 }
 
@@ -182,7 +182,7 @@ impl WritePipeline {
         embed: Arc<dyn EmbeddingClient>,
         llm: Arc<dyn LlmClient>,
         pii: Arc<dyn PiiDetector>,
-        db: Surreal<Db>,
+        db: Surreal<Any>,
         cfg: WritePipelineConfig,
     ) -> Self {
         Self {

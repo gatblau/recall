@@ -274,10 +274,10 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   added: 2026-06-21
 - id: FU-009
   title: Unify embedded + remote Store behind one type
-  why: Phase 2's `Store` is typed over the local engine, so `connect_remote` returns Unavailable; the remote engine seam (NFR-MA1, ADR-009 scale-out) is currently exercised only by the testcontainers test. Unify embedded/remote connection behind the one `Store` type so remote deployment works without a code change. Relates to FU-007.
+  why: Phase 2's `Store` is typed over the local engine, so `connect_remote` returns Unavailable; the remote engine seam (NFR-MA1, ADR-009 scale-out) is currently exercised only by the testcontainers test. Unify embedded/remote connection behind the one `Store` type so remote deployment works without a code change. Relates to FU-007. RESOLVED 2026-06-21: `Store`/`StoreWorkQueue`/`LeaseReaper`/`Migrator`/`WritePipeline` retyped from `Surreal<engine::local::Db>` to `Surreal<engine::any::Any>`; `Store::connect` builds an endpoint (`surrealkv://{path}` embedded, `mem://` in-memory, or `RECALL_STORE_REMOTE_URL` verbatim for `ws(s)`/`http(s)`) and opens it via `surrealdb::engine::any::connect`; the `connect_remote` Unavailable stub was deleted; main-crate `surrealdb` features gained `protocol-ws`/`protocol-http`/`rustls`. C1 spec connect step reconciled. Gates green (build/clippy/lib 87/bdd 69). New residual: FU-019 (remote auth).
   source: apply-phase-2
   suggested-command: /breakdown FU-009 from docs/wip/plan/01-recall-greenfield-build.md
-  status: open
+  status: done
   added: 2026-06-21
 - id: FU-010
   title: Reconcile the C2 work-queue spec to the as-built SurrealDB 3.x implementation
@@ -333,6 +333,13 @@ broker). After this gate is clean, run `/sync-check` to confirm Design ↔ Spec 
   why: Phase 10's security gate names `cargo audit` alongside secscan, but `cargo-audit` is not installed in this environment, so the dependency-CVE scan could not run (the four mandatory framework gates — build, lint, integration, secscan — all passed; coverage passed at 77.73% ≥ 70%). secscan (static) is clean repo-wide. Install and run before shipping.
   source: apply-phase-10
   suggested-command: cargo install cargo-audit && cargo audit
+  status: open
+  added: 2026-06-21
+- id: FU-019
+  title: Wire remote SurrealDB credentials (signin) for secured endpoints
+  why: FU-009 unified the connection on `engine::any` so a remote `ws(s)`/`http(s)` endpoint connects through the one `Store` type, but `Store::connect` does not call `signin(Root{...})` and `Config` has no remote-credential fields — so a *secured* remote server cannot authenticate (a no-auth endpoint works today). Add `RECALL_STORE_REMOTE_USER`/`RECALL_STORE_REMOTE_PASS` (Secret) config + a `signin` after `connect` when set, and a `use_ns`/`use_db` root-scope check. Deployment-blocking only for secured remote stores; the embedded default is unaffected.
+  source: sync-check-resolution
+  suggested-command: /breakdown FU-019 from docs/wip/plan/01-recall-greenfield-build.md
   status: open
   added: 2026-06-21
 - id: FU-018

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
-use surrealdb::engine::local::{Db, Mem, SurrealKv};
+use surrealdb::engine::any::Any;
 use surrealdb::types::Value;
 use surrealdb::Surreal;
 
@@ -30,31 +30,36 @@ use crate::types::scope::{can_read, ScopeContext, ScopeRef};
 
 use migrate::{map_db_err, validate_tenant, Migrator, DB_NAME};
 
-/// The embedded (or remote-capable) SurrealDB memory store.
+/// The SurrealDB memory store. The connection is typed over `surrealdb::engine::any::Any`, so the
+/// same `Store` carries either an embedded engine (SurrealKV / in-memory) or a remote endpoint
+/// (`ws(s)://` / `http(s)://`) — the engine is resolved from the endpoint scheme at connect time.
 pub struct Store {
-    db: Surreal<Db>,
+    db: Surreal<Any>,
     embed_dim: u32,
 }
 
 impl Store {
     /// Open the store from the loaded configuration. `RECALL_STORE_REMOTE_URL` (if set) wins over the
     /// embedded path with a startup warning (Phase 2D precedence); otherwise the embedded SurrealKV
-    /// engine is opened at `RECALL_STORE_PATH`. On any connection failure returns
-    /// `StoreError::Unavailable`.
+    /// engine is opened at `RECALL_STORE_PATH`. The connection is built through
+    /// `surrealdb::engine::any::connect`, which resolves the engine from the endpoint scheme
+    /// (`surrealkv://` embedded, `ws(s)://`/`http(s)://` remote — ADR-009 scale-out), so a remote
+    /// deployment needs no code change. On any connection failure returns `StoreError::Unavailable`.
     pub async fn connect(cfg: &Config) -> Result<Self, StoreError> {
-        if let Some(remote) = &cfg.store_remote_url {
+        let endpoint = if let Some(remote) = &cfg.store_remote_url {
             if !cfg.store_path.is_empty() {
                 tracing::warn!(
                     target: "recall",
                     "store.connect: both RECALL_STORE_REMOTE_URL and RECALL_STORE_PATH set; remote wins"
                 );
             }
-            // The remote leg connects over the network through the same `Surreal<Db>`-shaped seam
-            // exercised by the testcontainers round-trip; the embedded engines are the v1 default.
-            return Self::connect_remote(remote, cfg.embed_dim).await;
-        }
-        tracing::info!(target: "recall", backend = "surrealkv", "store.connect");
-        let db = Surreal::new::<SurrealKv>(cfg.store_path.clone())
+            tracing::info!(target: "recall", backend = "remote", "store.connect");
+            remote.clone()
+        } else {
+            tracing::info!(target: "recall", backend = "surrealkv", "store.connect");
+            format!("surrealkv://{}", cfg.store_path)
+        };
+        let db = surrealdb::engine::any::connect(endpoint)
             .await
             .map_err(map_db_err)?;
         Ok(Self {
@@ -65,24 +70,10 @@ impl Store {
 
     /// Open an in-memory store (the real engine, in-process) for tests and ephemeral runs.
     pub async fn new_in_memory(embed_dim: u32) -> Result<Self, StoreError> {
-        let db = Surreal::new::<Mem>(()).await.map_err(map_db_err)?;
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .map_err(map_db_err)?;
         Ok(Self { db, embed_dim })
-    }
-
-    /// Connect to a remote SurrealDB endpoint (ADR-009 scale-out). Kept private; the embedded engines
-    /// are the v1 path. The `surrealdb::engine::any` connector resolves the `ws(s)://`/`http(s)://`
-    /// scheme of the endpoint.
-    async fn connect_remote(_url: &str, embed_dim: u32) -> Result<Self, StoreError> {
-        // The `Surreal<Db>` (local engine) type cannot carry a remote connection; the remote leg is
-        // wired through `surrealdb::engine::any::Any` in `connect_any`. Phase 2 ships the embedded
-        // engines as the default and exercises the remote leg via the testcontainers round-trip in
-        // the integration suite (which constructs its own `Any` connection); see FU-007.
-        let _ = embed_dim;
-        Err(StoreError::Unavailable(
-            "remote store connection is wired via the engine::any seam in the integration suite; \
-             the embedded engine is the v1 default"
-                .into(),
-        ))
     }
 
     /// A `Migrator` bound to this store's connection.
@@ -90,11 +81,12 @@ impl Store {
         Migrator::new(&self.db, self.embed_dim)
     }
 
-    /// Share the embedded SurrealDB connection (the engine handle is internally `Arc`-backed, so a
-    /// clone reuses the same in-process database). The Durable Work Queue (C2) is built over this
-    /// handle so its `work_job`/`dead_letter` tables live inside the same engine as the C1 store
-    /// (SA-QUEUE-01: store-backed default, single-binary deployment intact).
-    pub fn handle(&self) -> Surreal<Db> {
+    /// Share the SurrealDB connection (the engine handle is internally `Arc`-backed, so a clone reuses
+    /// the same database — the same in-process engine when embedded, or the same network connection
+    /// when remote). The Durable Work Queue (C2) is built over this handle so its
+    /// `work_job`/`dead_letter` tables live inside the same engine as the C1 store (SA-QUEUE-01:
+    /// store-backed default, single-binary deployment intact).
+    pub fn handle(&self) -> Surreal<Any> {
         self.db.clone()
     }
 
@@ -986,10 +978,10 @@ impl Store {
     /// Bind the shared recall parameters (read filter + metadata filters + validity) onto a query.
     fn bind_recall<'q>(
         &self,
-        mut query: surrealdb::method::Query<'q, Db>,
+        mut query: surrealdb::method::Query<'q, Any>,
         ctx: &ScopeContext,
         q: &StageOneQuery,
-    ) -> surrealdb::method::Query<'q, Db> {
+    ) -> surrealdb::method::Query<'q, Any> {
         query = query
             .bind(("cuser", ctx.user.clone()))
             .bind(("cteams", ctx.teams.clone()));
@@ -1126,9 +1118,9 @@ fn json_to_value(v: &Json) -> Value {
 
 /// Bind the `$valid_at` parameter when a bi-temporal as-of filter is set.
 fn bind_valid_at(
-    query: surrealdb::method::Query<'_, Db>,
+    query: surrealdb::method::Query<'_, Any>,
     valid_at: Option<DateTime<Utc>>,
-) -> surrealdb::method::Query<'_, Db> {
+) -> surrealdb::method::Query<'_, Any> {
     match valid_at {
         Some(at) => query.bind(("valid_at", surrealdb::types::Datetime::from(at))),
         None => query,
@@ -1136,7 +1128,7 @@ fn bind_valid_at(
 }
 
 /// Whether a fact row currently carries a non-null embedding vector.
-async fn fact_has_embedding(db: &Surreal<Db>, id: &str) -> Result<bool, StoreError> {
+async fn fact_has_embedding(db: &Surreal<Any>, id: &str) -> Result<bool, StoreError> {
     let thing = id_thing(id)?;
     let mut resp = db
         .query("SELECT embedding FROM $id")

@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde_json::Value as Json;
-use surrealdb::engine::local::{Db, Mem};
+use surrealdb::engine::any::Any;
 use surrealdb::types::{Datetime, Object, Value};
 use surrealdb::Surreal;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +34,7 @@ use crate::types::scope::ScopeRef;
 /// tables live inside the same single-binary database.
 pub struct StoreWorkQueue {
     /// Shared SurrealDB connection (the engine handle is internally `Arc`-backed).
-    db: Surreal<Db>,
+    db: Surreal<Any>,
     /// `RECALL_EMBED_DIM`, required to run the C1+C2 migration set when provisioning a namespace.
     embed_dim: u32,
     /// `RECALL_JOB_MAX_ATTEMPTS` (default 5) — retry cap before dead-letter (SA-QUEUE-02).
@@ -45,7 +45,7 @@ pub struct StoreWorkQueue {
 
 impl StoreWorkQueue {
     /// Build a queue over a shared store connection and the C2 retry configuration.
-    pub fn new(db: Surreal<Db>, embed_dim: u32, max_attempts: u32, backoff_base_ms: u32) -> Self {
+    pub fn new(db: Surreal<Any>, embed_dim: u32, max_attempts: u32, backoff_base_ms: u32) -> Self {
         Self {
             db,
             embed_dim,
@@ -61,7 +61,7 @@ impl StoreWorkQueue {
         max_attempts: u32,
         backoff_base_ms: u32,
     ) -> Result<Self, QueueError> {
-        let db = Surreal::new::<Mem>(())
+        let db = surrealdb::engine::any::connect("mem://")
             .await
             .map_err(|e| QueueError::BackendUnavailable(e.to_string()))?;
         Ok(Self::new(db, embed_dim, max_attempts, backoff_base_ms))
@@ -458,7 +458,7 @@ impl StoreWorkQueue {
 /// Lease-reaper: a long-running task that periodically reverts expired leases to `Pending` across all
 /// tenant namespaces so a crashed worker's job is reclaimed. Runs until the cancellation token fires.
 pub struct LeaseReaper {
-    db: Surreal<Db>,
+    db: Surreal<Any>,
     embed_dim: u32,
     /// Reaper sweep cadence (`RECALL_QUEUE_REAPER_SECS`, default 30 s).
     interval: Duration,
@@ -466,7 +466,7 @@ pub struct LeaseReaper {
 
 impl LeaseReaper {
     /// Build a reaper bound to a shared store connection.
-    pub fn new(db: Surreal<Db>, embed_dim: u32, interval: Duration) -> Self {
+    pub fn new(db: Surreal<Any>, embed_dim: u32, interval: Duration) -> Self {
         Self {
             db,
             embed_dim,

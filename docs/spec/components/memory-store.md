@@ -399,10 +399,15 @@ different namespace.
 **Connection lifecycle (constructor `Store::connect(cfg)`):**
 
 1. Read `RECALL_STORE_REMOTE_URL`, `RECALL_STORE_PATH`, `RECALL_STORE_BACKEND`, `RECALL_EMBED_DIM` from
-   the loaded config. If `RECALL_STORE_REMOTE_URL` is set, connect to the remote SurrealDB/TiKV
-   endpoint and log a warning if `RECALL_STORE_PATH` is also set (remote wins). Otherwise open the
-   embedded engine at `RECALL_STORE_PATH` with the `surrealkv` or `rocksdb` backend. On any connection
-   failure return `StoreError::Unavailable`. Log span `store.connect` with field `backend`.
+   the loaded config. The connection is typed over `surrealdb::engine::any::Any` and opened through
+   `surrealdb::engine::any::connect(endpoint)`, so a single `Store` carries either an embedded engine
+   or a remote endpoint — the engine is resolved from the endpoint scheme (FU-009): `RECALL_STORE_REMOTE_URL`
+   verbatim when set (e.g. `ws://host:8000`, `http(s)://…`; log a warning if `RECALL_STORE_PATH` is also
+   set — remote wins), otherwise `surrealkv://{RECALL_STORE_PATH}` for the embedded default (in-process
+   tests/ephemeral runs use `mem://`). A remote deployment therefore needs no code change. On any
+   connection failure return `StoreError::Unavailable`. Log span `store.connect` with field `backend`.
+   *(Residual: a secured remote server needs `signin` credentials, which `connect` does not yet pass —
+   see the plan's remote-auth follow-up.)*
 2. Migrations are applied lazily per tenant through the `Migrator` (see Data Model): every read/write
    method first calls `ensure_and_use(tenant)`, which runs `Migrator::migrate_up(tenant)` (idempotent —
    a no-op once the namespace is at the latest version) then selects the tenant namespace and the

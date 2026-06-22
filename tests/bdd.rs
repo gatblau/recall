@@ -120,7 +120,7 @@ struct RecallWorld {
 struct ApiHarness {
     base_url: String,
     handle: tokio::task::JoinHandle<()>,
-    db: surrealdb::Surreal<surrealdb::engine::local::Db>,
+    db: surrealdb::Surreal<surrealdb::engine::any::Any>,
     issuer: Arc<LocalIssuer>,
     store: Arc<Store>,
     /// A clone of the AppState rate-limiter map, so a scenario can deterministically seed an empty
@@ -212,7 +212,7 @@ impl ApiHarness {
 struct SystemHarness {
     base_url: String,
     handle: tokio::task::JoinHandle<()>,
-    db: surrealdb::Surreal<surrealdb::engine::local::Db>,
+    db: surrealdb::Surreal<surrealdb::engine::any::Any>,
     issuer: Arc<LocalIssuer>,
     store: Arc<Store>,
     queue: Arc<StoreWorkQueue>,
@@ -254,7 +254,7 @@ impl SystemHarness {
 struct MaintHarness {
     store: Arc<Store>,
     queue: Arc<StoreWorkQueue>,
-    handle: surrealdb::Surreal<surrealdb::engine::local::Db>,
+    handle: surrealdb::Surreal<surrealdb::engine::any::Any>,
     mocks: support::ProviderMocks,
     embed_dim: u32,
 }
@@ -273,7 +273,7 @@ struct RetrievalHarness {
 struct FreshnessHarness {
     broker: Arc<HttpBrokerClient>,
     queue: Arc<StoreWorkQueue>,
-    handle: surrealdb::Surreal<surrealdb::engine::local::Db>,
+    handle: surrealdb::Surreal<surrealdb::engine::any::Any>,
     mocks: support::ProviderMocks,
     // Kept alive so the backing store engine is not dropped while the queue shares its connection.
     _store: Arc<Store>,
@@ -284,7 +284,7 @@ struct FreshnessHarness {
 struct WpHarness {
     store: Arc<Store>,
     queue: Arc<StoreWorkQueue>,
-    handle: surrealdb::Surreal<surrealdb::engine::local::Db>,
+    handle: surrealdb::Surreal<surrealdb::engine::any::Any>,
     mocks: support::ProviderMocks,
     embed_dim: u32,
     /// The contact string used by the PII scenarios (for the redaction span range).

@@ -29,7 +29,7 @@ async-trait = "0.1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["catch-panic"] }
 http = "1"
-surrealdb = { version = "3", features = ["kv-surrealkv", "kv-mem"] }
+surrealdb = { version = "3", features = ["kv-surrealkv", "kv-mem", "protocol-ws", "protocol-http", "rustls"] }
 sha2 = "0.10"
 tokio-util = "0.7"
 rand = "0.8"

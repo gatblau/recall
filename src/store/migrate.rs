@@ -4,7 +4,7 @@
 //! explicit user action; `dry_run` is the review artefact (sql-safety layer rule).
 
 use serde_json::Value as Json;
-use surrealdb::engine::local::Db;
+use surrealdb::engine::any::Any;
 use surrealdb::Surreal;
 
 use crate::types::ports::StoreError;
@@ -34,14 +34,14 @@ pub const DB_NAME: &str = "recall";
 
 /// Applies and reverses the numbered migration set against a per-tenant SurrealDB namespace.
 pub struct Migrator<'a> {
-    db: &'a Surreal<Db>,
+    db: &'a Surreal<Any>,
     /// The embedding dimension substituted into the HNSW index DDL (`RECALL_EMBED_DIM`, SA-EMBED-01).
     embed_dim: u32,
 }
 
 impl<'a> Migrator<'a> {
     /// Build a migrator bound to a live connection and the configured embedding dimension.
-    pub fn new(db: &'a Surreal<Db>, embed_dim: u32) -> Self {
+    pub fn new(db: &'a Surreal<Any>, embed_dim: u32) -> Self {
         Self { db, embed_dim }
     }
 
