@@ -146,13 +146,12 @@ After Phase 3: `cargo build` + `cargo clippy --all-targets -- -D warnings` clean
   status: open
   added: 2026-06-23
 - id: RISK-004
-  title: Intermittent BDD flake — one scenario aborted in ~1 of 5 full `cargo test` runs
-  why: observed during the FU-004 verification (4/5 runs 62/62; one run 61/62, 439 steps). Not introduced by FU-004 (which only renamed steps + removed dead stubs — no timing/concurrency change); pre-existing, likely a timing-sensitive harness scenario (ephemeral-port HTTP server poll, concurrent-claim, or decay/freshness timing). Could not reproduce on re-run to capture the scenario name.
+  title: Intermittent BDD flake — "Error path — body exceeds the size limit" (api_edge)
+  why: RCA (2026-06-23) — the step `when_post_big` (tests/bdd.rs) streams a 2 MiB body and did `req.send().await.expect("send big POST")`. The edge enforces the 1 MiB `DefaultBodyLimit` (src/api/mod.rs:110) by responding 413 and closing the connection; on some TCP timings it closes before reqwest finishes streaming the body, so `send()` returns Err and `.expect` panicked, aborting the scenario (~1/10 runs). Server + spec (413 VAL_BODY_TOO_LARGE) are correct and aligned — a test-reliability defect, not code/spec drift.
   source: apply-phase-3
   likelihood: medium
   impact: low
-  mitigation: investigate separately — re-run with `--test-threads=1` and cucumber per-scenario logging to capture the culprit; add a wait/retry or fixed clock if it is a poll race. Does not block the change (gate green on re-run).
-  suggested-command: /rca (capture the flaky scenario, then a targeted fix)
-  status: open
+  mitigation: FIXED 2026-06-23 — `when_post_big` now treats a send error (connection reset mid-upload) as the asserted 413, matching the Ok(413) path; no panic. Confirmed by a 20× repro loop.
+  status: mitigated
   added: 2026-06-23
 ```
