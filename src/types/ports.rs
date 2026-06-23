@@ -1,11 +1,10 @@
 //! Provider & infrastructure traits (§2C.6) — dependency-injected seams that keep providers
 //! swappable (OQ-MODELS/OQ-QUEUE/OQ-STORE).
 //!
-//! The traits are DECLARED here; component logic that implements them lands in Phases 2–8.
+//! The traits are DECLARED here; component logic that implements them lands in later phases.
 //! `StoreError`/`Candidate`/`StageOneQuery`/`AuditEntry` are owned by the C1 spec; `QueueError`
-//! by C2; `ExtractedFact`/`EntityMention` by C4; `InsightCandidate` by C7. Phase 1 defines
-//! minimal-but-complete versions of each here so the trait surface compiles; each component phase
-//! refines its owned type in place.
+//! by C2; `ExtractedFact`/`EntityMention` by C4. (recall is LLM-free — ADR-015 — so there is no
+//! `LlmClient` and no `InsightCandidate`.) Each component phase refines its owned type in place.
 
 use std::time::Duration;
 
@@ -165,27 +164,12 @@ pub struct EntityMention {
     pub canonical_name: Option<String>,
 }
 
-// --- Maintenance supporting type (C7; minimal Phase-1 form) ---
-
-/// A candidate consolidated insight produced by the LLM. Canonical definition owned by the C7 spec
-/// (Phase 8): the consolidation output of `LlmClient::consolidate`.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct InsightCandidate {
-    /// Structured semantic assertion (object).
-    pub content: serde_json::Value,
-    /// Entity ids the insight connects (>=1).
-    pub entities: Vec<String>,
-    /// Source episodic fact ids this insight summarises (>=1).
-    pub derived_from: Vec<String>,
-    /// [0,1] — LLM-proposed confidence, pre-validation.
-    pub confidence: f64,
-    /// How many source episodes the LLM judged supporting.
-    pub support_count: u32,
-}
+// (InsightCandidate removed by ADR-015 — server-side consolidation is dropped; the agent writes
+// consolidated insights itself as agent-stated facts.)
 
 // --- Provider-shared error/result types (§2C.6) ---
 
-/// Shared by EmbeddingClient/RerankClient/LlmClient/PiiDetector.
+/// Shared by EmbeddingClient/RerankClient/PiiDetector.
 #[derive(thiserror::Error, Debug)]
 pub enum ProviderError {
     /// -> 504 PROVIDER_TIMEOUT.
@@ -359,17 +343,8 @@ pub trait RerankClient: Send + Sync {
     async fn rerank(&self, query: &str, docs: &[String]) -> Result<Vec<f64>, ProviderError>;
 }
 
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    async fn extract(
-        &self,
-        content: &serde_json::Value,
-    ) -> Result<Vec<ExtractedFact>, ProviderError>;
-    async fn consolidate(
-        &self,
-        episodes: &[Fact],
-    ) -> Result<Vec<InsightCandidate>, ProviderError>;
-}
+// LlmClient removed by ADR-015 — recall is LLM-free: the agent extracts facts and consolidates
+// insights, and submits structured agent-asserted content. The write pipeline wraps it directly.
 
 // BrokerClient removed by ADR-014 — recall makes no outbound broker call.
 

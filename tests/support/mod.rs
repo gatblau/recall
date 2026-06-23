@@ -27,8 +27,6 @@ pub fn minimal_env() -> HashMap<String, String> {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", "https://rerank.test"),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", "https://llm.test"),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
         // Bind to an ephemeral port; the actual bound port is read back from the listener.
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
@@ -140,8 +138,6 @@ fn boot_env(issuer: &str) -> HashMap<String, String> {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", "https://rerank.test"),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", "https://llm.test"),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
         ("RECALL_EMBED_DIM", "8"),
@@ -187,8 +183,6 @@ pub async fn build_test_state(
     overrides.insert("RECALL_EMBED_API_KEY".into(), "test-embed-key".into());
     overrides.insert("RECALL_RERANK_URL".into(), mocks.base_url());
     overrides.insert("RECALL_RERANK_API_KEY".into(), "test-rerank-key".into());
-    overrides.insert("RECALL_LLM_URL".into(), "https://llm.test".into());
-    overrides.insert("RECALL_LLM_API_KEY".into(), "test-llm-key".into());
     overrides.insert("RECALL_HTTP_ADDR".into(), "127.0.0.1:0".into());
     overrides.insert("RECALL_ENV".into(), "development".into());
     overrides.insert("RECALL_EMBED_DIM".into(), embed_dim.to_string());
@@ -257,14 +251,16 @@ impl ProviderStub {
     }
 }
 
-// --- C4 Write Pipeline wiremock provider stubs (Phase 5) -------------------------------------------
+// --- Wiremock provider stubs (embedding + reranker) ------------------------------------------------
 //
-// A single `wiremock::MockServer` plays all three providers the write pipeline consumes, honouring the
-// wire contracts documented in `src/providers/mod.rs`:
+// A single `wiremock::MockServer` plays the model providers, honouring the wire contracts documented
+// in `src/providers/mod.rs`:
 //   * POST /embeddings  -> { "embeddings": [[f32; dim]] }
-//   * POST /extract     -> { "facts": [ { content, entity_mentions, memory_class, extractor_confidence } ] }
-//   * POST /pii/scan    -> { "spans": [ { json_pointer, start, end, pii_type, confidence } ] }
-// The server's base URL is used as RECALL_EMBED_URL / RECALL_LLM_URL so the HTTP adapters POST here.
+//   * POST /rerank      -> { "scores": [f64, ..] }
+// The server's base URL is used as RECALL_EMBED_URL / RECALL_RERANK_URL so the HTTP adapters POST here.
+// recall is LLM-free (ADR-015) and PII detection is in-process; the residual `mount_extract` stub is no
+// longer hit by the pipeline (it wraps structured content directly) — it only seeds test content and is
+// slated for removal (plan FU-004).
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -320,55 +316,8 @@ impl ProviderMocks {
             .await;
     }
 
-    /// Mount a `/pii/scan` stub returning no spans.
-    pub async fn mount_pii_none(&self) {
-        let body = serde_json::json!({ "spans": [] });
-        Mock::given(method("POST"))
-            .and(path("/pii/scan"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// Mount a `/pii/scan` stub flagging the `/contact` string with the given confidence and the full
-    /// string range as the span.
-    pub async fn mount_pii_contact(&self, contact: &str, confidence: f64) {
-        let body = serde_json::json!({
-            "spans": [{
-                "json_pointer": "/contact",
-                "start": 0,
-                "end": contact.len(),
-                "pii_type": "email",
-                "confidence": confidence
-            }]
-        });
-        Mock::given(method("POST"))
-            .and(path("/pii/scan"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// Mount a `/consolidate` stub returning the given `insights` array (the C7 consolidation wire
-    /// contract in `src/providers/mod.rs`): `POST /consolidate -> { "insights": [ { content, entities,
-    /// derived_from, confidence, support_count } ] }`.
-    pub async fn mount_consolidate(&self, insights_json: serde_json::Value) {
-        let body = serde_json::json!({ "insights": insights_json });
-        Mock::given(method("POST"))
-            .and(path("/consolidate"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
-    }
-
-    /// The number of recorded requests to `/consolidate` (proves the LLM was / was not called).
-    pub async fn consolidate_call_count(&self) -> usize {
-        self.server
-            .received_requests()
-            .await
-            .map(|reqs| reqs.iter().filter(|r| r.url.path() == "/consolidate").count())
-            .unwrap_or(0)
-    }
+    // PII detection is in-process (ADR-015) — no `/pii/scan` stub is mounted; the content itself
+    // deterministically decides what is flagged/redacted.
 
     /// The number of recorded requests to `/extract` (proves the LLM was / was not called).
     pub async fn extract_call_count(&self) -> usize {

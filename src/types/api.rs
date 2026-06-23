@@ -65,12 +65,12 @@ pub struct SourceProvenance {
 
 #[derive(Deserialize)]
 pub struct RememberRequest {
-    /// Raw content to extract a fact from.
+    /// Structured assertion object the agent has already extracted (no LLM extraction; ADR-015).
     pub content: serde_json::Value,
     pub source: Option<SourceInput>,
-    /// True => caller asserts this directly.
+    /// Optional caller-asserted class; defaults to `Episodic` (SA-WRITE-STRUCTURED-01).
     #[serde(default)]
-    pub agent_stated: bool,
+    pub memory_class: Option<MemoryClass>,
 }
 
 #[derive(Deserialize)]

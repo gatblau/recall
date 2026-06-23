@@ -1,29 +1,11 @@
 Feature: Maintenance Worker
 
-  The C7 Maintenance Worker consolidates episodes into validated insights, supersedes
-  contradictions non-destructively, decays low-salience stale facts, re-embeds stale-model facts,
-  and performs verifiable hard delete — all off the synchronous read path.
-
-  Scenario: Consolidation promotes a validated insight with source-capped confidence
-    Given a maintenance worker over an embedded store with embedding dimension 8
-    And 4 episodic facts sharing subject "team:alpha" with min confidence 0.6 for tenant "acme" user "u-1"
-    And the consolidation LLM returns one insight citing all 4 episodes with confidence 0.95
-    When the maintenance cycle runs for tenant "acme"
-    Then the ConsolidationReport reports promoted 1
-    And exactly 1 consolidated fact is persisted for tenant "acme"
-    And the persisted consolidated fact confidence is at most 0.6
-
-  Scenario: An insight citing a fact outside the scanned group is rejected
-    Given a maintenance worker over an embedded store with embedding dimension 8
-    And 4 episodic facts sharing subject "team:alpha" with min confidence 0.6 for tenant "acme" user "u-1"
-    And the consolidation LLM returns one insight citing an unknown fact with confidence 0.95
-    When the maintenance cycle runs for tenant "acme"
-    Then the ConsolidationReport reports rejected_validation 1
-    And exactly 0 consolidated facts are persisted for tenant "acme"
+  The C7 Maintenance Worker supersedes contradictions non-destructively, decays low-salience stale
+  facts, re-embeds stale-model facts, and performs verifiable hard delete — all off the synchronous
+  read path.
 
   Scenario: Two contradicting facts supersede the older non-destructively
     Given a maintenance worker over an embedded store with embedding dimension 8
-    And the consolidation LLM returns no insights
     And a fact "fact:old" with object "table:orders" valid from "2026-06-19T12:00:00.000Z" for tenant "acme" user "u-1"
     And a fact "fact:new" with object "table:invoices" valid from "2026-06-20T12:00:00.000Z" for tenant "acme" user "u-1"
     When the maintenance cycle runs for tenant "acme"
@@ -35,7 +17,6 @@ Feature: Maintenance Worker
 
   Scenario: Low-salience stale fact is pruned while high-salience survives
     Given a maintenance worker over an embedded store with embedding dimension 8
-    And the consolidation LLM returns no insights
     And a stale fact "fact:lowsal" with salience 0.1 last recalled 10 days ago for tenant "acme" user "u-1"
     And a stale fact "fact:highsal" with salience 0.9 last recalled 10 days ago for tenant "acme" user "u-1"
     When the maintenance cycle runs for tenant "acme"
@@ -52,16 +33,7 @@ Feature: Maintenance Worker
 
   Scenario: Re-embed dimension mismatch skips the fact without updating the embedding
     Given a maintenance worker over an embedded store with embedding dimension 8
-    And the consolidation LLM returns no insights
     And a stale-model fact "fact:reembed" for tenant "acme" user "u-1"
     And the embedding provider returns a vector of dimension 4
     When a ReEmbed job is handled for "fact:reembed" in tenant "acme" user "u-1"
     Then the re-embed handler fails with code "VAL_OUT_OF_RANGE"
-
-  Scenario: Around ten similar episodes consolidate into one insight
-    Given a maintenance worker over an embedded store with embedding dimension 8
-    And 10 episodic facts sharing subject "team:alpha" with min confidence 0.6 for tenant "acme" user "u-1"
-    And the consolidation LLM returns one insight citing all 10 episodes with confidence 0.8
-    When the maintenance cycle runs for tenant "acme"
-    Then the ConsolidationReport reports promoted 1
-    And exactly 1 consolidated fact is persisted for tenant "acme"

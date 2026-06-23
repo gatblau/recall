@@ -3,7 +3,7 @@
 **File:** `src/retrieval` | **Package:** `recall::retrieval` | **Phase:** 4 | **Dependencies:** C1 Memory Store
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.5.0
+> **derivedFromHld:** 0.6.0
 
 #### Purpose
 

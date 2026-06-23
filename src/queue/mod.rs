@@ -605,7 +605,6 @@ fn kind_str(k: JobKind) -> &'static str {
     match k {
         JobKind::ExtractFact => "extract_fact",
         JobKind::ReEmbedFact => "re_embed_fact",
-        JobKind::Consolidate => "consolidate",
         JobKind::HardDelete => "hard_delete",
     }
 }

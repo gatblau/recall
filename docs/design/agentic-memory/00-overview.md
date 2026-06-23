@@ -1,6 +1,6 @@
 # 00 — Overview
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 ## Summary
 
@@ -37,8 +37,9 @@ The full reasoning, the survey of existing systems, and the quality techniques a
   carrying its source provenance and a confidence score.
 - Facts that change over time are handled as evolution, not destructive overwrite: history is
   preserved and the current truth is always answerable.
-- Memory improves with use (episodic experience consolidates into reusable semantic knowledge) while
-  storage growth stays bounded by graceful forgetting.
+- Memory improves with use — the **agent** distils episodic experience into reusable semantic insights
+  and writes them back; `recall` stores and serves them and keeps storage growth bounded by graceful
+  forgetting.
 - Every request is authenticated (OIDC), authorised per user, and audited; no cross-user leakage.
 - Externally-sourced content cannot poison memory or be treated as instructions.
 
@@ -68,7 +69,7 @@ The full reasoning, the survey of existing systems, and the quality techniques a
 | Relationship (edge) | A typed connection between entities, itself carrying properties (timestamps, confidence, source). | "owns", "is lead of", "supersedes". |
 | Episodic memory | A record of a specific thing that happened, in sequence. | "On 2026-06-12 the user asked to audit the schema." |
 | Semantic memory | General, time-independent knowledge distilled from many episodes. | "Schema audits usually surface missing indexes." |
-| Consolidation | The background process that distils recurring episodes into semantic facts. | Promoting ten "standup at 9am" episodes into one durable fact. |
+| Consolidation | The **agent** distilling recurring episodes into a semantic fact and writing it back as a `consolidated` memory; `recall` stores it but performs no consolidation itself (ADR-015). | The agent promoting ten "standup at 9am" episodes into one durable fact and writing it to `recall`. |
 | Bi-temporal model | Storing two timelines per fact: when it was true in the world, and when the system learned it. | A "lead engineer" edge with validity 2026-01→2026-03 plus ingestion date. |
 | Supersession | Ending a superseded fact's validity and recording the successor, instead of deleting. | "Sarah is lead" ended; "Tom is lead" added; both retained. |
 | Salience | A fact's importance score, used to protect it from forgetting. | A production-region fact has high salience. |

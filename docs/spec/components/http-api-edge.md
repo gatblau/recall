@@ -2,7 +2,7 @@
 **File:** `src/api` | **Package:** `recall::api` | **Phase:** 5 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue), C3 (Auth & Scope), C6 (Retrieval Engine)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.5.0
+> **derivedFromHld:** 0.6.0
 
 #### Purpose
 
@@ -112,9 +112,9 @@ pub struct SourceProvenance {
 
 #[derive(Deserialize)]
 pub struct RememberRequest {
-    pub content: serde_json::Value,          // raw content to extract a fact from
+    pub content: serde_json::Value,          // structured assertion object (the fact to store)
     pub source: Option<SourceInput>,
-    #[serde(default)] pub agent_stated: bool,
+    #[serde(default)] pub memory_class: Option<MemoryClass>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +161,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
+pub enum JobKind { ExtractFact, ReEmbedFact, HardDelete }  // ReReadSource removed by ADR-014; Consolidate removed by ADR-015
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -240,7 +240,7 @@ Each route below states method + path + request schema + response schema + statu
 
 **`POST /v1/recall`** — read. Request body: `RecallRequest` (including the optional `include_provenance` flag, passed through to C6). Calls C6 `recall`. Response `200`: `Success<RecallResponse>` with `meta.abstained` set when C6 gated out all candidates and `meta.next_cursor` set when more results exist; each returned fact carries a `source` object only when `include_provenance` was set and the fact has a source (ADR-014). Errors: `400` `VAL_INVALID_BODY` / `VAL_OUT_OF_RANGE` / `VAL_UNSUPPORTED_CLASS`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `502`/`504` (provider), `503`/`504` (store).
 
-**`POST /v1/memories`** — write (async, ADR-004). Headers: `Idempotency-Key` (required, 1–255 chars). Request body: `RememberRequest`. Enqueues an `ExtractFact` `WorkJob` on C2. Response `202`: `Success<WriteAck>` with `status = Accepted` (first submission) or `status = AlreadyAccepted` (replay within the idempotency window). Errors: `400` `VAL_INVALID_BODY` / `VAL_MISSING_IDEMPOTENCY_KEY`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `503` `QUEUE_UNAVAILABLE`.
+**`POST /v1/memories`** — write (async, ADR-004). Headers: `Idempotency-Key` (required, 1–255 chars). Request body: `RememberRequest` — `content` must be a structured assertion object (recall holds no LLM and runs no extraction, ADR-015; C4 wraps the object directly). Enqueues an `ExtractFact` `WorkJob` on C2. Response `202`: `Success<WriteAck>` with `status = Accepted` (first submission) or `status = AlreadyAccepted` (replay within the idempotency window). Errors: `400` `VAL_INVALID_BODY` (malformed body or `content` not a JSON object) / `VAL_MISSING_IDEMPOTENCY_KEY`, `401`, `403` `AUTH_INSUFFICIENT_SCOPE`, `413`, `429`, `503` `QUEUE_UNAVAILABLE`.
 
 **`GET /v1/memories/{id}`** — read. Path param `id` (a `fact:<uuidv7>` record id). Optional headers: `If-Modified-Since` (RFC 3339) and `If-None-Match` (ETag). Calls C1 `get_fact` (scope-checked by C1 via `ScopeContext`). Response `200`: `Success<Fact>` with an `ETag` header derived from the fact's `ingested_at` and `id`; `304 Not Modified` (empty body) when `If-None-Match` matches the computed ETag or `If-Modified-Since` is at/after the fact's `ingested_at`. Errors: `401`, `403` `SCOPE_FORBIDDEN` (a different user's private fact in the same tenant), `404` `NOT_FOUND` (no such fact, or out of scope), `429`, `503`/`504` (store).
 

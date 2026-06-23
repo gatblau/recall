@@ -53,20 +53,18 @@ Feature: Write Pipeline
     And exactly 0 facts are persisted for tenant "acme" user "u-77"
     And exactly 1 quarantine row exists for tenant "acme"
 
-  Scenario: High-confidence PII span is redacted in place
+  Scenario: High-confidence PII (email) is redacted in place by the in-process detector
     Given the LLM extractor returns one contact fact "alice@example.com" with two entity mentions and confidence 0.95
     And the embedding provider returns a vector of dimension 8
-    And the PII detector flags the contact email with confidence 0.95
     And an enqueued extract_fact job "work_job:wp-pii-hi" for tenant "acme" user "u-77" with key "ik-pii-hi" and a trusted source
     When the write pipeline processes the next job
     Then the job outcome is "Persisted"
     And the persisted contact value is redacted as an email
     And the persisted fact has visibility "user-private" and pii_review false and an embedding set
 
-  Scenario: Low-confidence PII flag sets pii_review without redacting
+  Scenario: Low-confidence PII (phone) sets pii_review without redacting
     Given the LLM extractor returns one contact fact "call me at 555-1234" with two entity mentions and confidence 0.95
     And the embedding provider returns a vector of dimension 8
-    And the PII detector flags the contact email with confidence 0.6
     And an enqueued extract_fact job "work_job:wp-pii-lo" for tenant "acme" user "u-77" with key "ik-pii-lo" and a trusted source
     When the write pipeline processes the next job
     Then the job outcome is "Persisted"

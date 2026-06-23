@@ -1,6 +1,6 @@
 # 04 — Domain Model & Data Lifecycle
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 Field *types* are deferred to `/spec`; this section names entities, their relationships, and their
 lifecycle.

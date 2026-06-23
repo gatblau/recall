@@ -1,24 +1,24 @@
 //! C7 — Maintenance Worker. The asynchronous, idle-biased keeper of memory truth and bounded size.
 //!
-//! It runs off the synchronous read path (ADR-004) so LLM and embedding latency never enters the
-//! recall budget. Two cooperating drivers share one duty set: a **scheduler driver** ([`run_scheduler`])
+//! It runs off the synchronous read path (ADR-004) so embedding latency never enters the recall
+//! budget. Two cooperating drivers share one duty set: a **scheduler driver** ([`run_scheduler`])
 //! fires a full maintenance cycle per tenant on the idle-biased trigger (after `idle_quiet` of no
-//! ingestion, with a hard fallback every `consolidate_max_interval`); a **queue-consumer driver**
-//! ([`run_consumer`]) claims `Consolidate` / `ReEmbedFact` / `HardDelete` jobs from C2 and dispatches
-//! each to the same duty functions.
+//! ingestion, with a hard fallback every `maint_max_interval`); a **queue-consumer driver**
+//! ([`run_consumer`]) claims `ReEmbedFact` / `HardDelete` jobs from C2 and dispatches each to the same
+//! duty functions.
 //!
-//! Per tenant the worker performs five duties: (1) **consolidation** — distilling recent episodic facts
-//! into validated Consolidated Insights with source-capped decaying confidence (ADR-006/007); (2)
-//! **supersession** — ending the superseded fact's validity and recording successor links, never
-//! destructively (ADR-002); (3) **decay / forget** — Ebbinghaus retrievability with a salience floor;
-//! (4) **re-embed** — refreshing embeddings for stale-model facts (SA-EMBED-01); and (5) **verifiable
-//! hard delete** — removing a fact plus derived summaries and embeddings, returning a `DeletionProof`.
+//! Per tenant the worker performs four duties: (1) **supersession** — ending the superseded fact's
+//! validity and recording successor links, never destructively (ADR-002); (2) **decay / forget** —
+//! Ebbinghaus retrievability with a salience floor; (3) **re-embed** — refreshing embeddings for
+//! stale-model facts (SA-EMBED-01); and (4) **verifiable hard delete** — removing a fact plus derived
+//! summaries and embeddings, returning a `DeletionProof`. Recall holds no LLM (ADR-015): episodic→
+//! semantic consolidation is the agent's job, written back as agent-stated `Consolidated` facts.
 //!
 //! The decay maths and contradiction detection are pure, I/O-free cores ([`retrievability`],
-//! [`is_prune_candidate`], [`reinforce`], [`insight_confidence`], [`detect_contradiction`]) so they are
-//! unit-tested against case tables (ADR-010). Every destructive step is ordered last and proof-gated, so
-//! a failed cycle leaves prior memory intact. Structured logs carry `correlation_id` on every line; LLM
-//! and embedding keys are read from env only and never logged, and fact content is never logged.
+//! [`is_prune_candidate`], [`reinforce`], [`detect_contradiction`]) so they are unit-tested against case
+//! tables (ADR-010). Every destructive step is ordered last and proof-gated, so a failed cycle leaves
+//! prior memory intact. Structured logs carry `correlation_id` on every line; embedding keys are read
+//! from env only and never logged, and fact content is never logged.
 //!
 //! Scope: each store operation is scoped per tenant via a maintenance `ScopeContext` built from the
 //! tenant id alone (`teams = []`, `user = ""`, `token_jti = "maintenance"`, all ops allowed, a fresh
@@ -38,11 +38,9 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::{AppError, ValidationKind};
 use crate::types::api::DeletionProof;
-use crate::types::domain::{Fact, MemoryClass};
+use crate::types::domain::Fact;
 use crate::types::job::{JobKind, WorkJob};
-use crate::types::ports::{
-    EmbeddingClient, InsightCandidate, LlmClient, MemoryStore, ProviderError, WorkQueue,
-};
+use crate::types::ports::{EmbeddingClient, MemoryStore, ProviderError, WorkQueue};
 use crate::types::scope::{OpSet, ScopeContext, ScopeRef};
 
 /// The claim lease length for queue jobs (mirrors C2/C4 defaults).
@@ -55,7 +53,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 pub struct MaintenanceWorker {
     store: Arc<dyn MemoryStore>,
     queue: Arc<dyn WorkQueue>,
-    llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
     cfg: MaintenanceConfig,
 }
@@ -69,20 +66,16 @@ pub struct MaintenanceConfig {
     pub decay_k: f64,
     /// `RECALL_PRUNE_RETRIEVABILITY` — `R` below which a low-salience fact becomes a prune candidate.
     pub prune_retrievability: f64,
-    /// `RECALL_IDLE_QUIET_SECS` — idle period with no tenant writes before a consolidation cycle.
+    /// `RECALL_IDLE_QUIET_SECS` — idle period with no tenant writes before a maintenance cycle.
     pub idle_quiet: Duration,
-    /// `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS` — hard fallback consolidation interval (6 h).
-    pub consolidate_max_interval: Duration,
+    /// `RECALL_MAINT_MAX_INTERVAL_SECS` — hard fallback maintenance interval (6 h, SA-MAINT-CADENCE-01).
+    pub maint_max_interval: Duration,
     /// `RECALL_EMBED_DIM` — re-embed output length MUST equal this (SA-EMBED-01).
     pub embed_dim: u32,
     /// `RECALL_EMBED_MODEL_VERSION` — active embedding model id; a stale-version fact is a re-embed candidate.
     pub embed_model_version: String,
     /// `RECALL_MAINT_BATCH_SIZE` — per-duty scan bound (`limit`) per cycle.
     pub batch_size: u32,
-    /// `RECALL_MAINT_CONSOLIDATE_MIN_EPISODES` — minimum group size before consolidation is attempted.
-    pub min_episodes: u32,
-    /// `RECALL_INSIGHT_DECAY_FACTOR` — multiplicative confidence decay applied to a promoted insight.
-    pub insight_decay_factor: f64,
     /// `RECALL_REINFORCE_GAIN` — stability gain applied on recall (exposed for C6 + unit tests).
     pub reinforce_gain: f64,
 }
@@ -95,12 +88,10 @@ impl MaintenanceConfig {
             decay_k: c.decay_k,
             prune_retrievability: c.prune_retrievability,
             idle_quiet: Duration::from_secs(c.idle_quiet_secs as u64),
-            consolidate_max_interval: Duration::from_secs(c.consolidate_max_interval_secs as u64),
+            maint_max_interval: Duration::from_secs(c.maint_max_interval_secs as u64),
             embed_dim: c.embed_dim,
             embed_model_version: c.embed_model_version.clone(),
             batch_size: c.maint_batch_size,
-            min_episodes: c.maint_consolidate_min_episodes,
-            insight_decay_factor: c.insight_decay_factor,
             reinforce_gain: c.reinforce_gain,
         }
     }
@@ -135,21 +126,11 @@ pub struct HardDeletePayload {
 /// The per-duty summary returned by [`MaintenanceWorker::run_cycle`].
 #[derive(Serialize, Default, Clone)]
 pub struct CycleReport {
-    pub consolidation: ConsolidationReport,
     pub supersession: SupersessionReport,
     pub decay: DecayReport,
     pub reembed: ReEmbedReport,
     /// Duty names that errored this cycle.
     pub failed_duties: Vec<String>,
-}
-
-/// Consolidation-duty outcome counts.
-#[derive(Serialize, Default, Clone)]
-pub struct ConsolidationReport {
-    pub groups_seen: u32,
-    pub candidates: u32,
-    pub promoted: u32,
-    pub rejected_validation: u32,
 }
 
 /// Supersession-duty outcome counts.
@@ -181,14 +162,12 @@ impl MaintenanceWorker {
     pub fn new(
         store: Arc<dyn MemoryStore>,
         queue: Arc<dyn WorkQueue>,
-        llm: Arc<dyn LlmClient>,
         embed: Arc<dyn EmbeddingClient>,
         cfg: MaintenanceConfig,
     ) -> Self {
         Self {
             store,
             queue,
-            llm,
             embed,
             cfg,
         }
@@ -275,7 +254,7 @@ impl MaintenanceWorker {
     ) -> bool {
         // Fallback: no prior cycle, or the max interval has elapsed.
         let fallback_due = match last_cycle.get(tenant) {
-            Some(last) => now.duration_since(*last) >= self.cfg.consolidate_max_interval,
+            Some(last) => now.duration_since(*last) >= self.cfg.maint_max_interval,
             None => true,
         };
         if fallback_due {
@@ -293,14 +272,11 @@ impl MaintenanceWorker {
         }
     }
 
-    /// Queue-consumer driver. Runs until `shutdown` is cancelled. Claims Consolidate / ReEmbedFact /
-    /// HardDelete jobs and dispatches each to the matching handler, completing or failing per outcome.
+    /// Queue-consumer driver. Runs until `shutdown` is cancelled. Claims ReEmbedFact / HardDelete jobs
+    /// and dispatches each to the matching handler, completing or failing per outcome. (No Consolidate —
+    /// consolidation is agent-side, ADR-015.)
     pub async fn run_consumer(&self, shutdown: CancellationToken) {
-        let kinds = [
-            JobKind::Consolidate,
-            JobKind::ReEmbedFact,
-            JobKind::HardDelete,
-        ];
+        let kinds = [JobKind::ReEmbedFact, JobKind::HardDelete];
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         loop {
             tokio::select! {
@@ -328,7 +304,6 @@ impl MaintenanceWorker {
     async fn dispatch(&self, job: WorkJob) {
         let ctx = self.maint_ctx(&job.scope.tenant);
         let result = match job.kind {
-            JobKind::Consolidate => self.handle_consolidate(&job.scope).await.map(|_| ()),
             JobKind::ReEmbedFact => match parse_payload::<ReEmbedPayload>(&job.payload) {
                 Ok(p) => self.handle_reembed(&job.scope, &p).await,
                 Err(e) => Err(e),
@@ -378,17 +353,14 @@ impl MaintenanceWorker {
     // --- Cycle entrypoint and job handlers --------------------------------------------------------
 
     /// Full maintenance cycle for one tenant. Order is fixed and non-destructive-first:
-    /// consolidation → supersession → decay → re-embed. Never deletes (delete is HardDelete-job only).
-    /// An error in one duty is recorded in `failed_duties` and the cycle continues to the next duty.
+    /// supersession → decay → re-embed. Never deletes (delete is HardDelete-job only); no consolidation
+    /// (agent-side, ADR-015). An error in one duty is recorded in `failed_duties` and the cycle
+    /// continues to the next duty.
     pub async fn run_cycle(&self, tenant: &str) -> Result<CycleReport, AppError> {
         let ctx = self.maint_ctx(tenant);
         let now = Utc::now();
         let mut report = CycleReport::default();
 
-        match self.consolidate_tenant(&ctx).await {
-            Ok(r) => report.consolidation = r,
-            Err(e) => self.record_duty_failure(&mut report, "consolidate", &ctx, &e),
-        }
         match self.supersede_contradictions(&ctx).await {
             Ok(r) => report.supersession = r,
             Err(e) => self.record_duty_failure(&mut report, "supersede", &ctx, &e),
@@ -421,15 +393,6 @@ impl MaintenanceWorker {
             error = %e,
             "maintenance.duty.failed"
         );
-    }
-
-    /// Consolidate handler — episodic→semantic for one tenant scope.
-    pub async fn handle_consolidate(
-        &self,
-        scope: &ScopeRef,
-    ) -> Result<ConsolidationReport, AppError> {
-        let ctx = self.maint_ctx(&scope.tenant);
-        self.consolidate_tenant(&ctx).await
     }
 
     /// ReEmbedFact handler — re-embed one fact named in the job payload.
@@ -475,104 +438,6 @@ impl MaintenanceWorker {
     }
 
     // --- Duty functions ---------------------------------------------------------------------------
-
-    /// Distil recent episodic facts into validated Consolidated Insights for one tenant.
-    async fn consolidate_tenant(&self, ctx: &ScopeContext) -> Result<ConsolidationReport, AppError> {
-        let mut report = ConsolidationReport::default();
-        let now = Utc::now();
-        let since = now
-            - chrono::Duration::from_std(self.cfg.consolidate_max_interval)
-                .unwrap_or(chrono::Duration::zero());
-        let episodes = self
-            .store
-            .scan_recent_episodes(ctx, since, self.cfg.batch_size)
-            .await?;
-
-        // Group by subject signature: the sorted entity set + the content subject (where present).
-        let mut groups: HashMap<String, Vec<Fact>> = HashMap::new();
-        for f in episodes {
-            groups.entry(subject_signature(&f)).or_default().push(f);
-        }
-
-        for (_sig, group) in groups {
-            if (group.len() as u32) < self.cfg.min_episodes {
-                tracing::debug!(
-                    target: "recall",
-                    correlation_id = %ctx.correlation_id,
-                    group_size = group.len(),
-                    "maintenance.consolidate.group_too_small"
-                );
-                continue;
-            }
-            report.groups_seen += 1;
-
-            let candidates = self.llm.consolidate(&group).await?;
-            for candidate in candidates {
-                report.candidates += 1;
-                match self.validate_candidate(ctx, &candidate, &group).await? {
-                    Some(source_facts) => {
-                        let insight = build_insight(&candidate, &source_facts, self.cfg.insight_decay_factor, now);
-                        self.store.put_fact(&insight).await?;
-                        report.promoted += 1;
-                    }
-                    None => {
-                        report.rejected_validation += 1;
-                        tracing::info!(
-                            target: "recall",
-                            correlation_id = %ctx.correlation_id,
-                            "maintenance.consolidate.rejected"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(report)
-    }
-
-    /// Validate one candidate against its source facts. Returns the resolved source facts when valid,
-    /// `None` when the candidate fails any check (rejected, not promoted). Errors propagate only on a
-    /// store failure while resolving sources.
-    async fn validate_candidate(
-        &self,
-        ctx: &ScopeContext,
-        candidate: &InsightCandidate,
-        group: &[Fact],
-    ) -> Result<Option<Vec<Fact>>, AppError> {
-        // (c) content must be a JSON object.
-        if !candidate.content.is_object() {
-            return Ok(None);
-        }
-        // (a) derived_from non-empty and every id resolves to a fact in the scanned group.
-        if candidate.derived_from.is_empty() {
-            return Ok(None);
-        }
-        let mut source_facts = Vec::with_capacity(candidate.derived_from.len());
-        for id in &candidate.derived_from {
-            let in_group = group.iter().find(|f| &f.id == id);
-            match in_group {
-                Some(f) => source_facts.push(f.clone()),
-                None => {
-                    // Not in the scanned group — confirm via get_fact (a store error propagates); a
-                    // candidate citing a fact outside the group is rejected regardless.
-                    let _ = self.store.get_fact(ctx, id).await?;
-                    return Ok(None);
-                }
-            }
-        }
-        // (b) entities is a subset of the union of the source facts' entities.
-        let mut union: Vec<&String> = Vec::new();
-        for f in &source_facts {
-            for e in &f.entities {
-                if !union.contains(&e) {
-                    union.push(e);
-                }
-            }
-        }
-        if !candidate.entities.iter().all(|e| union.contains(&e)) {
-            return Ok(None);
-        }
-        Ok(Some(source_facts))
-    }
 
     /// Detect contradictions among currently-valid facts and supersede the older side (end_validity +
     /// successor links). Non-destructive; history retained.
@@ -739,26 +604,6 @@ pub fn reinforce(stability: f64, reinforce_gain: f64, now: DateTime<Utc>) -> (f6
     (stability * (1.0 + reinforce_gain), now)
 }
 
-/// Decaying confidence for a promoted insight (ADR-006): floor of
-/// `min(candidate.confidence, min(source confidences)) * insight_decay_factor` into [0,1].
-/// Guarantees an insight never outranks its source facts.
-pub fn insight_confidence(
-    candidate_confidence: f64,
-    source_confidences: &[f64],
-    insight_decay_factor: f64,
-) -> f64 {
-    let min_source = source_confidences
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
-    let cap = if min_source.is_finite() {
-        candidate_confidence.min(min_source)
-    } else {
-        candidate_confidence
-    };
-    (cap * insight_decay_factor).clamp(0.0, 1.0)
-}
-
 /// Contradiction-detection contract. Given two currently-valid facts about the same subject, decide
 /// whether `b` contradicts `a` and, if so, which one is superseded. Reads only `valid_from`,
 /// `confidence`, `id`, `content`, and `entities`; performs no I/O.
@@ -811,82 +656,6 @@ fn triple(content: &Json) -> (Option<&str>, Option<&str>, Option<&str>) {
 }
 
 // --- Internal helpers ------------------------------------------------------------------------------
-
-/// The subject signature a consolidation group is keyed on: the sorted entity set joined with the
-/// content subject (where present). Mirrors the "(entity-set, content-subject)" signature in the spec.
-fn subject_signature(f: &Fact) -> String {
-    let mut entities = f.entities.clone();
-    entities.sort();
-    let subject = f
-        .content
-        .as_object()
-        .and_then(|m| m.get("subject"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    format!("{}|{}", entities.join(","), subject)
-}
-
-/// Build a Consolidated Insight `Fact` from a validated candidate and its source facts (C7 step 5):
-/// source-capped decaying confidence; salience = max source salience; stability = 1.0; fresh validity;
-/// owner = common owner of the sources (else tenant-shared at the tenant scope).
-fn build_insight(
-    candidate: &InsightCandidate,
-    sources: &[Fact],
-    insight_decay_factor: f64,
-    now: DateTime<Utc>,
-) -> Fact {
-    use crate::types::domain::Visibility;
-
-    let source_confidences: Vec<f64> = sources.iter().map(|f| f.confidence).collect();
-    let confidence = insight_confidence(candidate.confidence, &source_confidences, insight_decay_factor);
-    let salience = sources.iter().map(|f| f.salience).fold(0.0_f64, f64::max);
-
-    // Owner: inherit the common owner of the sources; if they disagree on team/user, own at tenant
-    // visibility (TenantShared) under the tenant alone.
-    let tenant = sources
-        .first()
-        .map(|f| f.owner.tenant.clone())
-        .unwrap_or_default();
-    let same_owner = sources
-        .iter()
-        .all(|f| f.owner.team == sources[0].owner.team && f.owner.user == sources[0].owner.user);
-    let (owner, visibility) = if same_owner {
-        (
-            sources[0].owner.clone(),
-            sources[0].visibility,
-        )
-    } else {
-        (
-            ScopeRef {
-                tenant: tenant.clone(),
-                team: None,
-                user: String::new(),
-            },
-            Visibility::TenantShared,
-        )
-    };
-
-    Fact {
-        id: format!("fact:{}", Uuid::new_v4()),
-        content: candidate.content.clone(),
-        entities: candidate.entities.clone(),
-        source_id: None,
-        memory_class: MemoryClass::Consolidated,
-        visibility,
-        owner,
-        valid_from: now,
-        valid_to: None,
-        ingested_at: now,
-        confidence,
-        salience,
-        stability: 1.0,
-        pii_review: false,
-        supersedes: None,
-        superseded_by: None,
-        derived_from: candidate.derived_from.clone(),
-        last_recalled_at: None,
-    }
-}
 
 /// Render a JSON content object to a flat embedding-input text: every scalar leaf concatenated with
 /// spaces (mirrors the store's `content_to_text` so re-embed input matches first-embed input).
@@ -951,7 +720,6 @@ fn kind_str(k: JobKind) -> &'static str {
     match k {
         JobKind::ExtractFact => "extract_fact",
         JobKind::ReEmbedFact => "re_embed_fact",
-        JobKind::Consolidate => "consolidate",
         JobKind::HardDelete => "hard_delete",
     }
 }

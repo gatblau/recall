@@ -1,7 +1,7 @@
 # Phase 6 — Self-Audit
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
+> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 This is the blocking gate that promotes the spec set from *Draft* to *Approved*. Each checklist item
 is ticked against the generated specs (Phases 1–5). **Verdict: PASS** — every item is `[x]`.
@@ -12,6 +12,13 @@ freshness is agent-side. C5 Freshness Checker is **retired**; the recall-side so
 `RECALL_BROKER_URL`/`RECALL_FRESHNESS_*` are removed; `RankedFact` drops `currency` and gains a
 conditional `source` (`include_provenance`). The checklist below was re-run against the amended set
 (seven live component specs + retired C5) and still passes; the affected items are annotated.
+
+**RFC 02 / ADR-015 re-audit (2026-06-22).** `recall` is **LLM-free**: C4 drops LLM extraction (a
+`remember` payload carries a structured agent-asserted `content` object the pipeline wraps directly);
+C7 drops server-side consolidation (five duties → four). Removed: the `LlmClient` trait, `HttpLlmClient`,
+`InsightCandidate`, the `Consolidate` job kind, and `RECALL_LLM_*` + the consolidation config (one
+interval key renamed `RECALL_MAINT_MAX_INTERVAL_SECS`). PII detection is now in-process deterministic.
+The checklist was re-run against the LLM-free set and still passes; affected items are annotated.
 
 ```
 [x] Every entity has a complete data model with types and constraints.
@@ -51,7 +58,8 @@ conditional `source` (`include_provenance`). The checklist below was re-run agai
    ("in-process", "process boundary", and the noun "handle" in `Source.origin_ref` are not banned-verb
    usages.)
 4. **Gherkin ≥3.** Component counts: memory-store 6, work-queue 6, auth-scope 7, write-pipeline 10,
-   retrieval-engine 7, maintenance-worker 7, http-api-edge 11 (C5 freshness-checker retired — ADR-014).
+   retrieval-engine 7, maintenance-worker 6, http-api-edge 11 (C5 freshness-checker retired — ADR-014;
+   maintenance-worker dropped its consolidation scenario — ADR-015).
    Each cross-cutting spec (X1–X13) has exactly 3 (happy/edge/error). All ≥3.
 5. **Error table ≥2.** Components: memory-store 7, work-queue 5, auth-scope 5, write-pipeline 9,
    retrieval-engine 6, maintenance-worker 9, http-api-edge 17 (C5 retired). Cross-cutting specs
@@ -61,16 +69,16 @@ conditional `source` (`include_provenance`). The checklist below was re-run agai
    they emit no client-facing error path. This is a documented, justified exception, not an omission.
 6. **Both-side interactions.** C8↔C3 (auth), C8↔C6 (recall), C8↔C2 (enqueue), C8↔C1 (GET fact + audit);
    C6↔C1 (recall/store + `get_source` for conditional provenance); C4↔C2 (ExtractFact
-   consume), C4↔C1 (persist/entity/source); C7↔C2 (Consolidate/ReEmbed/HardDelete consume), C7↔C1
+   consume), C4↔C1 (persist/entity/source); C7↔C2 (ReEmbed/HardDelete consume), C7↔C1
    (scans/mutate/hard_delete); C2↔C1 (store-backed table + `list_tenants`). Each is stated on both the
    producing and consuming spec. (The C6↔C5 freshness-tag and C5↔C2 ReReadSource edges are removed — C5
    retired by ADR-014.)
 7. **Valid DAG.** Phase 2B + Phase 5: C1 → {C2,C3} → C4 → {C6,C7} → C8, cross-cutting at Phase 0.
    Every edge points to a higher phase; the async write path means there is no synchronous C8→C4 edge.
    No cycles.
-8. **Config complete.** §2D lists every env var with Type, Default, Required, Owner, Description (50
-   keys after reconciliation); conditional/mutual-exclusion rules stated; X6 specifies load order +
-   startup validation.
+8. **Config complete.** §2D lists every env var with Type, Default, Required, Owner, Description (46
+   keys after the ADR-014/ADR-015 removals — broker, freshness, and LLM/consolidation keys gone);
+   conditional/mutual-exclusion rules stated; X6 specifies load order + startup validation.
 9. **Self-contained.** Each component duplicates the shared types/env/read-filter it uses into its
    Shared Context (verified: C4's `Fact` copy carries `pii_review`, and it duplicates `Source` + the
    entity/source `MemoryStore` methods it calls). A code-gen LLM can implement each from its file alone.
@@ -93,8 +101,8 @@ conditional `source` (`include_provenance`). The checklist below was re-run agai
     tightening, HNSW dimension change), X7 (migration down pairs, refused destructive down on populated
     namespaces), C8 (`idempotency_record` `REMOVE TABLE`), C7 (`maintenance_state` non-destructive drop).
 17. **derivedFromHld present.** All six phase files, all eight component files (incl. the retired C5
-    tombstone), and the 13 cross-cutting specs carry a `derivedFromHld:` field, all now `0.5.0` after the
-    RFC-01 / ADR-014 amendment.
+    tombstone), and the 13 cross-cutting specs carry a `derivedFromHld:` field, all now `0.6.0` after the
+    RFC-01 / ADR-014 and RFC-02 / ADR-015 amendments.
 18. **No hidden ADRs.** Component *Approach* sections carry only component-scope "why-this-not-that"
     (permitted by the template); no system-level Decision·Context·Consequences·Alternatives paragraph
     sits in a spec — the v1 entity-resolution trade-off was promoted to HLD `10-risks.md` + the
@@ -102,14 +110,17 @@ conditional `source` (`include_provenance`). The checklist below was re-run agai
 19. **Glossary terms in HLD.** Under ADR-014 the read-path currency terms `stale-pending-refresh` and
     `unverified-currency` were **removed** from both the HLD glossary and the spec set (no longer recall
     concepts); the `Source provenance (response)` term the LLD now uses is spec-local (an implementation
-    mechanism, correctly not an HLD domain term per the bubble-up rule). The remaining Phase-1 `[LLD]`
-    terms (`Work job`, `Dead letter`, `Trust score`, `Scope partition key`) are implementation-mechanism
-    names, correctly spec-local — not HLD domain terms.
-20. **Pins current.** Every `derivedFromHld:` equals the HLD's current `revision: 0.5.0`; no stale
-    phase (verified by scan — zero `0.4.x` pins remain).
-21. **Changelog coverage.** The HLD bump to 0.5.0 has a matching `99-changelog.md` line (RFC 01 /
-    ADR-014: passive store, agent-side freshness). README and all child banners read 0.5.0
-    (D-HLD-5 sibling consistency holds; D-HLD-6 satisfied).
+    mechanism, correctly not an HLD domain term per the bubble-up rule). Under ADR-015 the `Consolidation`
+    glossary term was **reframed agent-side** in both the HLD and Phase 1 (the agent consolidates; recall
+    stores), and `Consolidated Insight` retained (still a memory class the agent writes). The remaining
+    Phase-1 `[LLD]` terms (`Work job`, `Dead letter`, `Trust score`, `Scope partition key`) are
+    implementation-mechanism names, correctly spec-local — not HLD domain terms.
+20. **Pins current.** Every `derivedFromHld:` equals the HLD's current `revision: 0.6.0`; no stale
+    phase (verified by scan — zero `0.4.x`/`0.5.x` pins remain).
+21. **Changelog coverage.** The HLD bumps to 0.5.0 (RFC 01 / ADR-014: passive store, agent-side
+    freshness) and 0.6.0 (RFC 02 / ADR-015: LLM-free, extraction + consolidation agent-side) each have a
+    matching `99-changelog.md` line. README and all child banners read 0.6.0 (D-HLD-5 sibling consistency
+    holds; D-HLD-6 satisfied).
 
 ## Verdict
 

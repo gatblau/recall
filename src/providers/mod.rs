@@ -1,20 +1,12 @@
-//! Thin `reqwest`-based HTTP adapters for the five provider traits (§2B: provider adapters carry no
-//! domain logic; their contracts are the traits in §2C.6).
-//!
-//! Phase 1 wired the adapter structs, their construction (base URL, API key, per-call timeout) and
-//! the trait surface. Phase 5 (C4 Write Pipeline) implements the wire bodies for the three providers
-//! the write pipeline consumes — `EmbeddingClient::embed`, `LlmClient::extract`,
-//! `PiiDetector::scan` — as real `reqwest` POST calls with concrete, documented JSON request/response
-//! shapes (these ARE the wire contract the integration-suite wiremock stubs honour). Phase 7
-//! (C6 Retrieval Engine) wires `RerankClient::rerank` (the cross-encoder); Phase 8 (C7 Maintenance
-//! Worker) wires `LlmClient::consolidate` (episodic->semantic consolidation). Every provider is now
-//! wired — none remains a skeleton. (The Faraday broker adapter was removed by ADR-014 — freshness is
-//! agent-side; recall makes no outbound broker call.)
+//! Thin `reqwest`-based HTTP adapters for the provider traits (§2B: provider adapters carry no
+//! domain logic; their contracts are the traits in §2C.6). recall is LLM-free (ADR-015) and makes no
+//! outbound broker call (ADR-014): the only outbound providers are the embedding and reranker model
+//! inferences. PII detection is in-process (`LocalPiiDetector`), not an HTTP adapter.
 //!
 //! ## Wire contracts (the JSON shapes the wiremock stubs honour)
 //!
-//! All three POST to the configured base URL with `Content-Type: application/json` and, where an API
-//! key is configured, an `Authorization: Bearer <key>` header. The per-call timeout is uniform
+//! Each POSTs to the configured base URL with `Content-Type: application/json` and, where an API key
+//! is configured, an `Authorization: Bearer <key>` header. The per-call timeout is uniform
 //! ([`DEFAULT_TIMEOUT`]); a `reqwest` timeout maps to `ProviderError::Timeout`, a non-2xx status to
 //! `ProviderError::Status(code)`, a transport failure to `ProviderError::Transport`, and a malformed
 //! / unexpected body to `ProviderError::Malformed`.
@@ -23,47 +15,24 @@
 //! Request:  `{ "model": "<RECALL_EMBED_MODEL_VERSION>", "input": ["text", ...] }`
 //! Response: `{ "embeddings": [[f32, ...], ...] }` — one vector per input, each of `RECALL_EMBED_DIM`.
 //!
-//! ### LLM extract — `POST {RECALL_LLM_URL}/extract`
-//! Request:  `{ "content": <json object> }`
-//! Response: `{ "facts": [ { "content": <json object>,
-//!                            "entity_mentions": [ { "surface_form": "..",
-//!                                                   "mention_type": "person"|null } ],
-//!                            "memory_class": "episodic"|"semantic"|"consolidated",
-//!                            "asserted_valid_from": "<rfc3339>"|null,
-//!                            "extractor_confidence": f64 } ] }`
-//!
-//! ### PII scan — `POST {RECALL_PII_URL or RECALL_LLM_URL}/pii/scan`
-//! Request:  `{ "content": <json object> }`
-//! Response: `{ "spans": [ { "json_pointer": "/path", "start": u32, "end": u32,
-//!                            "pii_type": "email"|"phone"|.., "confidence": f64 } ] }`
-//!
 //! ### Rerank — `POST {RECALL_RERANK_URL}/rerank`
 //! Request:  `{ "query": "..", "documents": ["..", ..] }`
 //! Response: `{ "scores": [f64, ..] }` — one relevance score per document, positionally aligned.
 //!
-//! ### LLM consolidate — `POST {RECALL_LLM_URL}/consolidate`
-//! Request:  `{ "episodes": [<Fact as JSON>, ...] }` — the recent episodic facts of one subject group.
-//! Response: `{ "insights": [ { "content": <json object>,
-//!                              "entities": ["entity:..", ..],
-//!                              "derived_from": ["fact:..", ..],
-//!                              "confidence": f64,
-//!                              "support_count": u32 } ] }` — one proposed semantic insight per element,
-//!           mapped onto [`InsightCandidate`]; the worker validates each against its sources before
-//!           promotion (C7).
+//! (Fact extraction and consolidation are agent-side; PII detection is in-process — no HTTP contracts.)
 //!
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::config::Config;
-use crate::types::domain::{Fact, MemoryClass};
 use crate::types::ports::{
-    EmbeddingClient, EntityMention, ExtractedFact, InsightCandidate, LlmClient, PiiDetector, PiiSpan,
-    ProviderError, RerankClient,
+    EmbeddingClient, PiiDetector, PiiSpan, ProviderError, RerankClient,
 };
 
 /// Default per-call timeout for a provider HTTP request. Each external call carries its own timeout
@@ -192,234 +161,135 @@ impl RerankClient for HttpRerankClient {
     }
 }
 
-/// HTTP adapter for the extraction/consolidation LLM (C4/C7, async path only).
-pub struct HttpLlmClient {
-    client: Client,
-    base_url: String,
-    api_key: String,
-}
-
-impl HttpLlmClient {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            client: build_client(DEFAULT_TIMEOUT),
-            base_url: config.llm_url.clone(),
-            api_key: config.llm_api_key.expose().to_owned(),
-        }
-    }
-}
-
-/// The LLM extract response body: a list of extracted facts in the wire shape.
-#[derive(Deserialize)]
-struct ExtractResponse {
-    facts: Vec<WireExtractedFact>,
-}
-
-/// The wire shape of one extracted fact. Mapped onto the canonical [`ExtractedFact`] domain type,
-/// whose field names differ (the C4 spec names `entities`/`confidence`; the wire uses the spec's
-/// public-interface names `entity_mentions`/`extractor_confidence`/`memory_class`/`asserted_valid_from`).
-#[derive(Deserialize)]
-struct WireExtractedFact {
-    content: serde_json::Value,
-    #[serde(default)]
-    entity_mentions: Vec<WireEntityMention>,
-    #[serde(default)]
-    memory_class: Option<String>,
-    #[serde(default)]
-    extractor_confidence: f64,
-}
-
-/// The wire shape of one entity mention.
-#[derive(Deserialize)]
-struct WireEntityMention {
-    surface_form: String,
-    #[serde(default)]
-    mention_type: Option<String>,
-}
-
-/// The LLM consolidate response body: a list of proposed semantic insights in the wire shape.
-#[derive(Deserialize)]
-struct ConsolidateResponse {
-    #[serde(default)]
-    insights: Vec<WireInsight>,
-}
-
-/// The wire shape of one consolidated insight (field names match the [`InsightCandidate`] type).
-#[derive(Deserialize)]
-struct WireInsight {
-    content: serde_json::Value,
-    #[serde(default)]
-    entities: Vec<String>,
-    #[serde(default)]
-    derived_from: Vec<String>,
-    #[serde(default)]
-    confidence: f64,
-    #[serde(default)]
-    support_count: u32,
-}
-
-/// Parse a kebab-case `memory_class` string from the wire; defaults to `episodic` when absent or
-/// unrecognised (the safest class — episodic facts decay rather than persisting as durable semantics).
-fn parse_memory_class(raw: Option<&str>) -> MemoryClass {
-    match raw {
-        Some("semantic") => MemoryClass::Semantic,
-        Some("consolidated") => MemoryClass::Consolidated,
-        _ => MemoryClass::Episodic,
-    }
-}
-
-#[async_trait]
-impl LlmClient for HttpLlmClient {
-    async fn extract(
-        &self,
-        content: &serde_json::Value,
-    ) -> Result<Vec<ExtractedFact>, ProviderError> {
-        let url = format!("{}/extract", self.base_url.trim_end_matches('/'));
-        let body = json!({ "content": content });
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err("llm.extract", e))?;
-        if !resp.status().is_success() {
-            return Err(ProviderError::Status(resp.status().as_u16()));
-        }
-        let parsed: ExtractResponse = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Malformed(format!("llm.extract: {e}")))?;
-        Ok(parsed
-            .facts
-            .into_iter()
-            .map(|wf| ExtractedFact {
-                content: wf.content,
-                entities: wf
-                    .entity_mentions
-                    .into_iter()
-                    .map(|m| EntityMention {
-                        surface: m.surface_form,
-                        canonical_name: m.mention_type,
-                    })
-                    .collect(),
-                memory_class: parse_memory_class(wf.memory_class.as_deref()),
-                confidence: wf.extractor_confidence,
-            })
-            .collect())
-    }
-
-    /// Distil a group of recent episodic facts into proposed semantic insights (C7 consolidation duty).
-    ///
-    /// `POST {RECALL_LLM_URL}/consolidate` with `{ "episodes": [<Fact as JSON>, ...] }`; the response
-    /// `{ "insights": [ { content, entities, derived_from, confidence, support_count } ] }` is mapped
-    /// onto [`InsightCandidate`]. A `reqwest` timeout maps to `ProviderError::Timeout`; a non-2xx status
-    /// to `ProviderError::Status`; a malformed body to `ProviderError::Malformed`. The worker validates
-    /// each candidate against its sources before promotion.
-    async fn consolidate(
-        &self,
-        episodes: &[Fact],
-    ) -> Result<Vec<InsightCandidate>, ProviderError> {
-        let url = format!("{}/consolidate", self.base_url.trim_end_matches('/'));
-        let body = json!({ "episodes": episodes });
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err("llm.consolidate", e))?;
-        if !resp.status().is_success() {
-            return Err(ProviderError::Status(resp.status().as_u16()));
-        }
-        let parsed: ConsolidateResponse = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Malformed(format!("llm.consolidate: {e}")))?;
-        Ok(parsed
-            .insights
-            .into_iter()
-            .map(|wi| InsightCandidate {
-                content: wi.content,
-                entities: wi.entities,
-                derived_from: wi.derived_from,
-                confidence: wi.confidence,
-                support_count: wi.support_count,
-            })
-            .collect())
-    }
-}
-
+// HttpLlmClient removed by ADR-015 — recall is LLM-free: no fact extraction and no consolidation LLM
+// call. The agent extracts/consolidates and submits structured agent-asserted content.
 // HttpBrokerClient removed by ADR-014 — recall makes no outbound broker call; freshness is agent-side.
 
-/// PII detector adapter (C4). Model/heuristic adapter; HTTP-backed. There is no dedicated PII config
-/// key in §2D, so the detector POSTs to the LLM provider base URL under a `/pii/scan` path with the
-/// LLM API key (the PII model is co-located with the extraction model in v1).
-pub struct HttpPiiDetector {
-    client: Client,
-    base_url: String,
-    api_key: String,
-}
+/// In-process deterministic PII detector (C4, ADR-015). `recall` holds no LLM and makes no outbound
+/// call for PII: this scans each string leaf of the content for structured identifiers (email,
+/// phone, credit-card-via-Luhn) by pattern, emitting a [`PiiSpan`] per match with a confidence keyed
+/// to pattern strength. The `PiiDetector` trait remains a DI seam so a model-backed detector can be
+/// injected; this is the default impl. Free-text names/addresses are out of scope (handled agent-side).
+pub struct LocalPiiDetector;
 
-impl HttpPiiDetector {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            client: build_client(DEFAULT_TIMEOUT),
-            base_url: config.llm_url.clone(),
-            api_key: config.llm_api_key.expose().to_owned(),
-        }
+impl LocalPiiDetector {
+    pub fn new() -> Self {
+        LocalPiiDetector
     }
 }
 
-/// The PII scan response body: the detected spans.
-#[derive(Deserialize)]
-struct PiiResponse {
-    #[serde(default)]
-    spans: Vec<WirePiiSpan>,
+impl Default for LocalPiiDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-/// The wire shape of one PII span (field names match the [`PiiSpan`] domain type exactly).
-#[derive(Deserialize)]
-struct WirePiiSpan {
-    json_pointer: String,
-    start: u32,
-    end: u32,
-    pii_type: String,
-    confidence: f64,
+/// Compiled detectors, built once. `email` and a phone/card *candidate* matcher; phone vs card is
+/// disambiguated by digit count (phone 7..=11, card 13..=19 + Luhn) so a card never reads as a phone.
+fn pii_email_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap())
+}
+
+/// A run of digits with common separators (spaces, dashes, dots, parens, leading +). Digit count is
+/// checked in code to classify phone vs card and to reject short noise.
+fn pii_digitrun_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\+?[0-9][0-9 .()\-]{5,}[0-9]").unwrap())
+}
+
+/// Luhn checksum over the digits of `s` (used to confirm a credit-card candidate).
+fn luhn_ok(digits: &[u8]) -> bool {
+    let mut sum = 0u32;
+    let mut double = false;
+    for &d in digits.iter().rev() {
+        let mut v = u32::from(d);
+        if double {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+        double = !double;
+    }
+    sum.is_multiple_of(10)
+}
+
+/// Append a `PiiSpan` for every detector hit inside `s` located at `pointer`. Email and card are
+/// high-confidence (redacted); phone is low-confidence (flagged for review). Overlapping lower-priority
+/// matches are dropped so a single value is never double-spanned.
+fn scan_string(pointer: &str, s: &str, out: &mut Vec<PiiSpan>) {
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let overlaps = |taken: &[(usize, usize)], a: usize, b: usize| {
+        taken.iter().any(|&(x, y)| a < y && x < b)
+    };
+
+    // Email — confidence 0.95 (redact).
+    for m in pii_email_re().find_iter(s) {
+        taken.push((m.start(), m.end()));
+        out.push(PiiSpan {
+            json_pointer: pointer.to_string(),
+            start: m.start() as u32,
+            end: m.end() as u32,
+            pii_type: "email".to_string(),
+            confidence: 0.95,
+        });
+    }
+
+    // Digit runs → credit card (13..=19 digits + Luhn, 0.95 redact) or phone (7..=11 digits, 0.6 flag).
+    for m in pii_digitrun_re().find_iter(s) {
+        if overlaps(&taken, m.start(), m.end()) {
+            continue;
+        }
+        let digits: Vec<u8> = m.as_str().bytes().filter(|b| b.is_ascii_digit()).map(|b| b - b'0').collect();
+        let n = digits.len();
+        let (pii_type, confidence) = if (13..=19).contains(&n) && luhn_ok(&digits) {
+            ("credit_card", 0.95)
+        } else if (7..=11).contains(&n) {
+            ("phone", 0.6)
+        } else {
+            continue;
+        };
+        taken.push((m.start(), m.end()));
+        out.push(PiiSpan {
+            json_pointer: pointer.to_string(),
+            start: m.start() as u32,
+            end: m.end() as u32,
+            pii_type: pii_type.to_string(),
+            confidence,
+        });
+    }
+}
+
+/// Escape a JSON object key per RFC 6901 (`~` → `~0`, `/` → `~1`) for the pointer path.
+fn rfc6901_escape(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Walk the content, scanning every string leaf and building its RFC 6901 pointer.
+fn collect_pii_spans(value: &serde_json::Value, pointer: &str, out: &mut Vec<PiiSpan>) {
+    match value {
+        serde_json::Value::String(s) => scan_string(pointer, s, out),
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                collect_pii_spans(item, &format!("{pointer}/{i}"), out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                collect_pii_spans(v, &format!("{pointer}/{}", rfc6901_escape(k)), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[async_trait]
-impl PiiDetector for HttpPiiDetector {
+impl PiiDetector for LocalPiiDetector {
     async fn scan(&self, content: &serde_json::Value) -> Result<Vec<PiiSpan>, ProviderError> {
-        let url = format!("{}/pii/scan", self.base_url.trim_end_matches('/'));
-        let body = json!({ "content": content });
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err("pii", e))?;
-        if !resp.status().is_success() {
-            return Err(ProviderError::Status(resp.status().as_u16()));
-        }
-        let parsed: PiiResponse = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Malformed(format!("pii: {e}")))?;
-        Ok(parsed
-            .spans
-            .into_iter()
-            .map(|w| PiiSpan {
-                json_pointer: w.json_pointer,
-                start: w.start,
-                end: w.end,
-                pii_type: w.pii_type,
-                confidence: w.confidence,
-            })
-            .collect())
+        let mut spans = Vec::new();
+        collect_pii_spans(content, "", &mut spans);
+        Ok(spans)
     }
 }

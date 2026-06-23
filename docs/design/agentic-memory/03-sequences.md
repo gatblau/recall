@@ -1,6 +1,6 @@
 # 03 — Principal Sequences
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 Logical order-of-operations for the four principal flows. Payload detail is deferred to `/spec`.
 
@@ -61,7 +61,7 @@ sequenceDiagram
     API->>Q: enqueue write job (idempotency-keyed)
     API-->>Broker: accepted (idempotent ack)
     Q->>WP: dequeue
-    WP->>WP: filter → extract structured fact → normalise → entity-resolve → score importance+confidence
+    WP->>WP: filter → normalise → entity-resolve → score importance+confidence (content arrives structured; no LLM extraction, ADR-015)
     WP->>WP: write gate (trust score)
     alt trusted
         WP->>Store: persist fact (provenance, validity, scores)
@@ -77,30 +77,26 @@ sequenceDiagram
   embedding provider failure → bounded retry with backoff, then dead-letter for later reprocessing;
   write never blocks a read.
 
-## Sequence: Consolidate & maintain (asynchronous, idle-biased)
+## Sequence: Maintain (asynchronous, idle-biased)
 
 ```mermaid
 sequenceDiagram
     participant Sched as Scheduler / idle trigger
     participant MW as Maintenance Worker
     participant Store as Memory Store
-    participant LLM as LLM provider
 
     Sched->>MW: run maintenance cycle
-    MW->>Store: read recent episodes + contradiction candidates (scoped)
-    MW->>LLM: surprise-weighted consolidation (episodic→semantic)
-    LLM-->>MW: candidate insights
-    MW->>MW: validate insights against source facts, assign decaying confidence
-    MW->>Store: promote validated insights, supersede contradictions (end validity, keep history)
-    MW->>Store: apply graceful decay with salience floor, then re-embed changed facts
+    MW->>Store: read contradiction + decay + re-embed candidates (scoped)
+    MW->>Store: supersede contradictions (end validity, keep history)
+    MW->>Store: apply graceful decay with salience floor, then re-embed stale-model facts
 ```
 
 - **Trigger:** schedule or idle period.
-- **Result:** episodes distilled into semantic facts, contradictions superseded (history retained),
-  stale low-salience facts decayed, embeddings refreshed.
-- **Error posture:** a failed consolidation cycle leaves prior memory intact (no destructive step);
-  an insight that fails validation is not promoted; inferences carry expiring confidence so a wrong
-  one self-heals.
+- **Result:** contradictions superseded (history retained), stale low-salience facts decayed,
+  embeddings refreshed. **No consolidation here** — the agent distils episodes into insights and writes
+  them back as agent-stated `consolidated` facts (ADR-015); the worker makes no LLM call.
+- **Error posture:** a failed maintenance cycle leaves prior memory intact (no destructive step);
+  inferences carry expiring confidence so a wrong one self-heals.
 
 ## Sequence: Forget / verifiable deletion
 

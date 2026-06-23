@@ -2,15 +2,15 @@
 **File:** `src/maintenance` | **Package:** `recall::maintenance` | **Phase:** 4 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.5.0
+> **derivedFromHld:** 0.6.0
 
 #### Purpose
 
-The Maintenance Worker is the asynchronous, idle-biased keeper of memory truth and bounded size. It runs off the synchronous read path so that LLM and embedding latency never enters the budget a recall caller waits on (ADR-004). Per tenant it performs five duties: (1) **consolidation** — distilling recent episodic facts into semantic Consolidated Insights, each validated against its source facts before promotion and carrying decaying confidence (ADR-006, ADR-007); (2) **supersession** — detecting contradicting facts and ending the superseded fact's validity while recording successor links, never destructively (ADR-002); (3) **decay / forget** — applying the Ebbinghaus retrievability model with a salience floor so high-importance facts survive disuse and stale low-salience facts become prune candidates (SA-DECAY-01, ADR-006); (4) **re-embed** — refreshing embeddings for facts whose content changed or whose embedding-model version is stale (SA-EMBED-01); and (5) **verifiable hard delete** — removing a fact plus its derived summaries and embeddings and returning a `DeletionProof`, supporting the right to erasure (SA-DELETE-01, HLD 06). It exists because memory left unmaintained drowns retrieval, accumulates contradictions, and grows without bound.
+The Maintenance Worker is the asynchronous, idle-biased keeper of memory truth and bounded size. It runs off the synchronous read path so that embedding latency never enters the budget a recall caller waits on (ADR-004). Per tenant it performs four duties: (1) **supersession** — detecting contradicting facts and ending the superseded fact's validity while recording successor links, never destructively (ADR-002); (2) **decay / forget** — applying the Ebbinghaus retrievability model with a salience floor so high-importance facts survive disuse and stale low-salience facts become prune candidates (SA-DECAY-01, ADR-006); (3) **re-embed** — refreshing embeddings for facts whose content changed or whose embedding-model version is stale (SA-EMBED-01); and (4) **verifiable hard delete** — removing a fact plus its derived summaries and embeddings and returning a `DeletionProof`, supporting the right to erasure (SA-DELETE-01, HLD 06). It exists because memory left unmaintained drowns retrieval, accumulates contradictions, and grows without bound. Recall holds no LLM (ADR-015), so server-side consolidation of episodic facts into semantic insights is not a maintenance duty; the agent writes consolidated insights itself as agent-stated facts (`MemoryClass::Consolidated`, `derived_from`).
 
 #### Approach
 
-The worker is structured as two cooperating drivers over a single shared duty set. A **scheduler driver** fires a full maintenance cycle per tenant on the idle-biased trigger (SA-CONSOL-01): after `RECALL_IDLE_QUIET_SECS` of no writes for a tenant, with a hard fallback every `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS`. A **queue-consumer driver** claims `Consolidate`, `ReEmbedFact`, and `HardDelete` jobs from the `WorkQueue` (C2) and dispatches each to the same duty functions the scheduler uses. Two alternatives were rejected: a write-path-synchronous maintenance pass (rejected — puts LLM/embedding latency on the read or write path, violating ADR-004); and a single global timer with no per-tenant idle signal (rejected — wastes LLM cost consolidating quiet tenants and starves busy ones, contradicting SA-CONSOL-01). The decay maths and contradiction detection are pure functions isolated from I/O so they are unit-tested against case tables (ADR-007 auditability, ADR-010 algorithmic-core unit tests). Every destructive step is ordered last and gated on proof, so a failed cycle leaves prior memory intact.
+The worker is structured as two cooperating drivers over a single shared duty set. A **scheduler driver** fires a full maintenance cycle per tenant on the idle-biased trigger (SA-MAINT-CADENCE-01): after `RECALL_IDLE_QUIET_SECS` of no writes for a tenant, with a hard fallback every `RECALL_MAINT_MAX_INTERVAL_SECS`. A **queue-consumer driver** claims `ReEmbedFact` and `HardDelete` jobs from the `WorkQueue` (C2) and dispatches each to the same duty functions the scheduler uses. Two alternatives were rejected: a write-path-synchronous maintenance pass (rejected — puts embedding latency on the read or write path, violating ADR-004); and a single global timer with no per-tenant idle signal (rejected — wastes store load on quiet tenants and starves busy ones, contradicting SA-MAINT-CADENCE-01). The decay maths and contradiction detection are pure functions isolated from I/O so they are unit-tested against case tables (ADR-007 auditability, ADR-010 algorithmic-core unit tests). Every destructive step is ordered last and gated on proof, so a failed cycle leaves prior memory intact.
 
 #### Shared Context
 
@@ -105,7 +105,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
+pub enum JobKind { ExtractFact, ReEmbedFact, HardDelete }  // ReReadSource removed by ADR-014; Consolidate removed by ADR-015
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -140,31 +140,9 @@ pub trait WorkQueue: Send + Sync {
 pub trait EmbeddingClient: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError>; // dim = RECALL_EMBED_DIM
 }
-
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    async fn extract(&self, content: &serde_json::Value) -> Result<Vec<ExtractedFact>, ProviderError>;
-    async fn consolidate(&self, episodes: &[Fact]) -> Result<Vec<InsightCandidate>, ProviderError>;
-}
 ```
 
-`StoreError`, `QueueError`, `ProviderError`, `ExtractedFact` are owned by their respective component specs (C1, C2, C4) and referenced here by name. `InsightCandidate` is **owned by this spec** (defined under *Public Interface*) — it is the consolidation output of `LlmClient::consolidate`.
-
-##### Consolidate wire contract (defined by this component)
-
-`LlmClient::consolidate` is realised over HTTP by the provider adapter (`src/providers`). The wire contract is owned here because C7 is the sole consumer:
-
-```
-POST {RECALL_LLM_URL}/consolidate
-Request:  { "episodes": [<Fact as JSON>, ...] }      // the recent episodic facts of one subject group
-Response: { "insights": [ { "content": <json object>,
-                            "entities": ["entity:..", ...],
-                            "derived_from": ["fact:..", ...],
-                            "confidence": <f64>,
-                            "support_count": <u32> } ] }
-```
-
-Each `insights[]` element maps field-for-field onto `InsightCandidate`. A request timeout maps to `ProviderError::Timeout`; a non-2xx status to `ProviderError::Status`; a transport failure to `ProviderError::Transport`; a body that fails to deserialise into the response shape to `ProviderError::Malformed`. The worker validates every mapped candidate against its source facts before promotion (see *Internal Logic*).
+`StoreError`, `QueueError`, `ProviderError` are owned by their respective component specs (C1, C2) and referenced here by name. Recall holds no LLM (ADR-015): server-side consolidation is removed, so this component consumes no `LlmClient` and defines no consolidation candidate or wire contract.
 
 ##### MemoryStore surface required by C7 (extension of 2C.6 owned by C1)
 
@@ -211,16 +189,13 @@ async fn list_tenants(&self) -> Result<Vec<String>, StoreError>;
 | `RECALL_SALIENCE_FLOOR` | f64 | `0.3` | Decay salience floor; a fact at or above this is never time-pruned (SA-DECAY-01). |
 | `RECALL_DECAY_K` | f64 | `10.0` | Global decay constant `k` in `R = exp(-Δt/(s·k))`. |
 | `RECALL_PRUNE_RETRIEVABILITY` | f64 | `0.05` | Retrievability `R` below which a low-salience fact becomes a prune candidate. |
-| `RECALL_IDLE_QUIET_SECS` | u32 | `300` | Idle period with no tenant writes before a consolidation cycle (SA-CONSOL-01). |
-| `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS` | u32 | `21600` | Hard fallback consolidation interval (6 h). |
+| `RECALL_IDLE_QUIET_SECS` | u32 | `300` | Idle period with no tenant writes before a maintenance cycle (SA-MAINT-CADENCE-01). |
+| `RECALL_MAINT_MAX_INTERVAL_SECS` | u32 | `21600` | Hard fallback maintenance interval (6 h). |
 | `RECALL_EMBED_DIM` | u32 | `1024` | Embedding dimension; re-embed output length MUST equal this (SA-EMBED-01). |
 | `RECALL_EMBED_MODEL_VERSION` | string | _(none)_ | **[LLD]** Identifier of the active embedding model; a fact embedded under a different version is a re-embed candidate. Recorded in *Gaps* (not present in 2D). |
-| `RECALL_LLM_URL` | url | _(none, required)_ | Consolidation LLM endpoint (async path only). |
-| `RECALL_LLM_API_KEY` | secret | _(none, required)_ | LLM key (env only). |
 | `RECALL_EMBED_URL` | url | _(none, required)_ | Embedding provider endpoint. |
 | `RECALL_EMBED_API_KEY` | secret | _(none, required)_ | Embedding provider key (env only). |
-| `RECALL_MAINT_BATCH_SIZE` | u32 | `200` | **[LLD]** Per-duty scan bound (`limit`) per cycle, capping LLM/embedding/store load. Recorded in *Gaps* (not present in 2D). |
-| `RECALL_MAINT_CONSOLIDATE_MIN_EPISODES` | u32 | `3` | **[LLD]** Minimum episodic facts sharing a subject before consolidation is attempted. Recorded in *Gaps* (not present in 2D). |
+| `RECALL_MAINT_BATCH_SIZE` | u32 | `200` | **[LLD]** Per-duty scan bound (`limit`) per cycle, capping embedding/store load. Recorded in *Gaps* (not present in 2D). |
 | `RECALL_LOG_LEVEL` | enum | `info` | Structured-log verbosity. |
 
 #### Public Interface
@@ -233,7 +208,6 @@ All entry points and the duty functions, with exact signatures. The decay maths 
 pub struct MaintenanceWorker {
     store: Arc<dyn MemoryStore>,
     queue: Arc<dyn WorkQueue>,
-    llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
     cfg: MaintenanceConfig,
 }
@@ -244,12 +218,10 @@ pub struct MaintenanceConfig {
     pub decay_k: f64,               // RECALL_DECAY_K
     pub prune_retrievability: f64,  // RECALL_PRUNE_RETRIEVABILITY
     pub idle_quiet: Duration,       // RECALL_IDLE_QUIET_SECS
-    pub consolidate_max_interval: Duration, // RECALL_CONSOLIDATE_MAX_INTERVAL_SECS
+    pub maint_max_interval: Duration, // RECALL_MAINT_MAX_INTERVAL_SECS
     pub embed_dim: u32,             // RECALL_EMBED_DIM
     pub embed_model_version: String,// RECALL_EMBED_MODEL_VERSION
     pub batch_size: u32,            // RECALL_MAINT_BATCH_SIZE
-    pub min_episodes: u32,          // RECALL_MAINT_CONSOLIDATE_MIN_EPISODES
-    pub insight_decay_factor: f64,  // RECALL_INSIGHT_DECAY_FACTOR
     pub reinforce_gain: f64,        // RECALL_REINFORCE_GAIN
 }
 
@@ -257,7 +229,6 @@ impl MaintenanceWorker {
     pub fn new(
         store: Arc<dyn MemoryStore>,
         queue: Arc<dyn WorkQueue>,
-        llm: Arc<dyn LlmClient>,
         embed: Arc<dyn EmbeddingClient>,
         cfg: MaintenanceConfig,
     ) -> Self;
@@ -266,7 +237,7 @@ impl MaintenanceWorker {
     /// idle/fallback trigger and runs a full maintenance cycle for those that are due.
     pub async fn run_scheduler(&self, shutdown: CancellationToken);
 
-    /// Queue-consumer driver. Runs until `shutdown` is cancelled. Claims Consolidate / ReEmbedFact /
+    /// Queue-consumer driver. Runs until `shutdown` is cancelled. Claims ReEmbedFact /
     /// HardDelete jobs and dispatches each to the matching handler.
     pub async fn run_consumer(&self, shutdown: CancellationToken);
 }
@@ -276,13 +247,10 @@ impl MaintenanceWorker {
 
 ```rust
 /// Full maintenance cycle for one tenant. Order is fixed and non-destructive-first:
-/// consolidation → supersession → decay → re-embed. Never deletes (delete is HardDelete-job only).
+/// supersession → decay → re-embed. Never deletes (delete is HardDelete-job only).
 /// Returns a per-duty summary; an error in one duty is recorded in the summary and the cycle
 /// continues to the next non-dependent duty (prior memory stays intact).
 pub async fn run_cycle(&self, tenant: &str) -> Result<CycleReport, AppError>;
-
-/// Consolidate handler — episodic→semantic for one tenant scope.
-pub async fn handle_consolidate(&self, scope: &ScopeRef) -> Result<ConsolidationReport, AppError>;
 
 /// ReEmbedFact handler — re-embed one fact named in the job payload.
 pub async fn handle_reembed(&self, scope: &ScopeRef, payload: &ReEmbedPayload)
@@ -297,12 +265,6 @@ pub async fn handle_hard_delete(&self, scope: &ScopeRef, payload: &HardDeletePay
 ##### Duty functions (exact signatures)
 
 ```rust
-/// Distil recent episodic facts into validated Consolidated Insights for one tenant.
-/// 1. scan recent episodes; 2. group by subject; 3. call LlmClient::consolidate per group of
-///    >= min_episodes; 4. validate each candidate against its sources; 5. promote validated only,
-///    with decaying, source-capped confidence. Returns the per-group outcome.
-async fn consolidate_tenant(&self, ctx: &ScopeContext) -> Result<ConsolidationReport, AppError>;
-
 /// Detect contradictions among currently-valid facts and supersede the older side
 /// (end_validity + successor links). Non-destructive; history retained.
 async fn supersede_contradictions(&self, ctx: &ScopeContext) -> Result<SupersessionReport, AppError>;
@@ -330,11 +292,6 @@ pub fn is_prune_candidate(r: f64, salience: f64, prune_retrievability: f64, sali
 pub fn reinforce(stability: f64, reinforce_gain: f64, now: DateTime<Utc>)
     -> (f64, DateTime<Utc>);
 
-/// Decaying confidence for a promoted insight (ADR-006, 04-domain):
-/// floor(min(candidate.confidence, min(source confidences)) * insight_decay_factor) into [0,1].
-/// Guarantees an insight never outranks its source facts.
-pub fn insight_confidence(candidate_confidence: f64, source_confidences: &[f64], insight_decay_factor: f64) -> f64;
-
 /// Contradiction-detection contract. Given two currently-valid facts about the same subject,
 /// decide whether `b` contradicts `a` and, if so, which one is superseded.
 pub fn detect_contradiction(a: &Fact, b: &Fact) -> ContradictionVerdict;
@@ -343,17 +300,6 @@ pub fn detect_contradiction(a: &Fact, b: &Fact) -> ContradictionVerdict;
 ##### Types owned by this spec
 
 ```rust
-/// Output of LlmClient::consolidate — a proposed semantic insight from a set of episodes.
-/// Defined here because C7 is the sole consumer (2C.6 references it by name).
-#[derive(Serialize, Deserialize, Clone)]
-pub struct InsightCandidate {
-    pub content: serde_json::Value,   // structured semantic assertion (object)
-    pub entities: Vec<String>,        // entity ids the insight connects (>=1)
-    pub derived_from: Vec<String>,    // source episodic fact ids this insight summarises (>=1)
-    pub confidence: f64,              // [0,1] LLM-proposed confidence, pre-validation
-    pub support_count: u32,           // how many source episodes the LLM judged supporting
-}
-
 /// Result of comparing two facts for contradiction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ContradictionVerdict {
@@ -370,15 +316,12 @@ pub struct HardDeletePayload { pub fact_id: String } // "fact:<uuidv7>"
 
 #[derive(Serialize, Default, Clone)]
 pub struct CycleReport {
-    pub consolidation: ConsolidationReport,
     pub supersession: SupersessionReport,
     pub decay: DecayReport,
     pub reembed: ReEmbedReport,
     pub failed_duties: Vec<String>,   // duty names that errored this cycle
 }
 
-#[derive(Serialize, Default, Clone)]
-pub struct ConsolidationReport { pub groups_seen: u32, pub candidates: u32, pub promoted: u32, pub rejected_validation: u32 }
 #[derive(Serialize, Default, Clone)]
 pub struct SupersessionReport { pub pairs_checked: u32, pub superseded: u32 }
 #[derive(Serialize, Default, Clone)]
@@ -422,30 +365,21 @@ Decay maths example (pure core): `retrievability(delta_secs = 864000.0 /*10 days
 As built, the per-tenant `last_cycle_at` fallback clock is held in an in-memory `HashMap<String, tokio::time::Instant>` for the lifetime of the loop. The `maintenance_state` table (see *Data Model*) is a future-persistence seam the worker does not yet read or write; v1 cycle bookkeeping is in-memory and resets on restart, which forces every tenant to be treated as due on the next tick after a restart (a benign re-run, not data loss). This is an intentional as-built decision: the worker holds only the four injected seams (`store`, `queue`, `llm`, `embed`) and depends on no `maintenance_state` read.
 
 1. Loop until `shutdown` fires. Each iteration: call `MemoryStore::list_tenants()`. On `StoreError`, log `maintenance.scheduler.list_tenants_failed`, back off one tick, continue (the scheduler never aborts on a transient store error).
-2. For each tenant, decide whether its cycle is **due** via `tenant_is_due`: the **fallback** trigger fires when there is no in-memory `last_cycle_at` for the tenant OR `now - last_cycle_at >= consolidate_max_interval`; otherwise the **idle** trigger fires when `scan_recent_episodes(ctx, since = now - idle_quiet, limit = 1)` returns an **empty** result (no recent ingestion → quiet → idle, SA-CONSOL-01). A transient store error on the idle probe returns `false` (not a reason to consolidate; the fallback timer governs progress). This avoids any cross-component write coupling — C7 does not depend on C4 stamping a field.
+2. For each tenant, decide whether its cycle is **due** via `tenant_is_due`: the **fallback** trigger fires when there is no in-memory `last_cycle_at` for the tenant OR `now - last_cycle_at >= maint_max_interval`; otherwise the **idle** trigger fires when `scan_recent_episodes(ctx, since = now - idle_quiet, limit = 1)` returns an **empty** result (no recent ingestion → quiet → idle, SA-MAINT-CADENCE-01). A transient store error on the idle probe returns `false` (not a reason to run a cycle; the fallback timer governs progress). This avoids any cross-component write coupling — C7 does not depend on C4 stamping a field.
 3. For each due tenant, build the maintenance `ScopeContext` and call `run_cycle(tenant)`. On `Ok`, insert `now` into the in-memory `last_cycle` map. On `Err`, log `maintenance.cycle.failed` with the tenant and `correlation_id`; do **not** advance the in-memory `last_cycle_at` (the fallback timer re-tries the tenant next tick). Possible errors: `AppError::Store`, `AppError::Provider`.
 
 ##### `run_consumer`
 
-1. Loop until `shutdown` fires. Each iteration: call `WorkQueue::claim(&[JobKind::Consolidate, JobKind::ReEmbedFact, JobKind::HardDelete], lease)`. On `QueueError`, log `maintenance.consumer.claim_failed`, back off one tick, continue.
+1. Loop until `shutdown` fires. Each iteration: call `WorkQueue::claim(&[JobKind::ReEmbedFact, JobKind::HardDelete], lease)`. On `QueueError`, log `maintenance.consumer.claim_failed`, back off one tick, continue.
 2. On `Ok(None)` (no job), sleep one poll interval and continue.
-3. On `Ok(Some(job))`, build a maintenance `ScopeContext` from `job.scope.tenant` (per *Shared Context*). Dispatch by `job.kind`: `Consolidate` → `handle_consolidate(&job.scope)`; `ReEmbedFact` → `handle_reembed(&job.scope, &serde_from(job.payload)?)`; `HardDelete` → `handle_hard_delete(&job.scope, &serde_from(job.payload)?)`. A payload that fails to deserialise is `AppError::Validation` → `WorkQueue::fail(job_id, retryable=false)` (the job is malformed and will never succeed) → moves toward dead-letter (SA-QUEUE-02).
+3. On `Ok(Some(job))`, build a maintenance `ScopeContext` from `job.scope.tenant` (per *Shared Context*). Dispatch by `job.kind`: `ReEmbedFact` → `handle_reembed(&job.scope, &serde_from(job.payload)?)`; `HardDelete` → `handle_hard_delete(&job.scope, &serde_from(job.payload)?)`. A payload that fails to deserialise is `AppError::Validation` → `WorkQueue::fail(job_id, retryable=false)` (the job is malformed and will never succeed) → moves toward dead-letter (SA-QUEUE-02).
 4. On handler `Ok`, call `WorkQueue::complete(job_id)`. On handler `Err`: classify — `AppError::Provider(ProviderError::Timeout)` and `AppError::Store`/`AppError::Queue` are retryable → `WorkQueue::fail(job_id, retryable=true)`; `AppError::Validation`/`AppError::NotFound` are non-retryable → `WorkQueue::fail(job_id, retryable=false)`. Log `maintenance.job.failed` with `job.kind`, `job.id`, error code, `correlation_id`.
 
 ##### `run_cycle`
 
 1. Build the maintenance `ScopeContext` for `tenant`. Initialise an empty `CycleReport`.
-2. Run duties in fixed, non-destructive-first order: `consolidate_tenant` → `supersede_contradictions` → `decay_tenant(now)` → `reembed_tenant`. For each duty, on `Err` record the duty name in `report.failed_duties`, log `maintenance.duty.failed` with the duty name and `correlation_id`, and continue to the next duty. No duty deletes any record; the destructive HardDelete path is reached only via the queue handler. This realises the HLD error posture: a failed consolidation cycle leaves prior memory intact (03-sequences, "Consolidate & maintain").
+2. Run duties in fixed, non-destructive-first order: `supersede_contradictions` → `decay_tenant(now)` → `reembed_tenant`. For each duty, on `Err` record the duty name in `report.failed_duties`, log `maintenance.duty.failed` with the duty name and `correlation_id`, and continue to the next duty. No duty deletes any record; the destructive HardDelete path is reached only via the queue handler. This realises the HLD error posture: a failed maintenance cycle leaves prior memory intact (03-sequences, "Maintain").
 3. Return `Ok(report)` if no duty raised an unrecoverable error; the duty-level failures are carried in `failed_duties` rather than aborting the cycle.
-
-##### `consolidate_tenant` / `handle_consolidate`
-
-1. `scan_recent_episodes(ctx, since = now - consolidate_max_interval, limit = batch_size)`. On `StoreError` → `AppError::Store`.
-2. Group episodes by subject signature (the same `(entity-set, content-subject)` signature the store groups on). Discard any group with fewer than `min_episodes` members (insufficient evidence to consolidate; logged at debug).
-3. For each qualifying group, call `LlmClient::consolidate(&group)`. On `ProviderError::Timeout` → `AppError::Provider` (retryable); the group is skipped this cycle, prior memory unchanged.
-4. **Validate each `InsightCandidate` against its source facts before promotion** (ADR-006, 04-domain): the candidate is valid iff (a) `derived_from` is non-empty and every id resolves via `get_fact` to a fact in the scanned group; (b) `entities` is a subset of the union of the source facts' entities; (c) `content` is a JSON object. A candidate failing any check is **not promoted** (`rejected_validation += 1`, logged `maintenance.consolidate.rejected`).
-5. For each validated candidate, build a Consolidated Insight `Fact`: `memory_class = Consolidated`; `confidence = insight_confidence(candidate.confidence, source_confidences, insight_decay_factor)` — this caps the insight below the minimum source confidence so **an insight never outranks its source facts**; `derived_from = candidate.derived_from`; `salience = max of source saliences`; `stability = 1.0`; `valid_from = now`, `valid_to = None`, `ingested_at = now`; `owner` = the common owner of the sources (if sources disagree on team/user, the insight is owned at tenant visibility — `visibility = TenantShared`, else inherit). Persist via `MemoryStore::put_fact`. On `StoreError` → `AppError::Store`. `promoted += 1`.
-6. An unvalidated candidate is discarded with expiring confidence semantics: because promoted insights carry decaying confidence and are re-derived each cycle, a wrong insight self-heals (03-sequences error posture). Return the `ConsolidationReport`.
 
 ##### `supersede_contradictions`
 
@@ -481,9 +415,10 @@ The worker **mutates C1-owned tables**; it does not own the `fact` table. The fi
 
 - `valid_to` — set on supersession (`end_validity`) and on decay-prune (`end_validity`).
 - `supersedes` / `superseded_by` — set on supersession to record successor links.
-- `confidence`, `salience`, `stability`, `last_recalled_at` — set via `update_fact_maintenance_fields` (decay/consolidation bookkeeping; reinforcement values are computed by C6 and written via the same call).
+- `confidence`, `salience`, `stability`, `last_recalled_at` — set via `update_fact_maintenance_fields` (decay/supersession bookkeeping; reinforcement values are computed by C6 and written via the same call).
 - the fact embedding vector + its embedding-model version — set via `set_fact_embedding` on re-embed.
-- new `Consolidated` `fact` rows are inserted via `put_fact` (promotion).
+
+The worker no longer inserts `Consolidated` `fact` rows: recall holds no LLM (ADR-015), so server-side consolidation is removed. The agent writes consolidated insights itself as agent-stated facts through the C4 write path (`MemoryClass::Consolidated`, `derived_from`); C7 then maintains them like any other fact.
 
 The worker **owns one small table**, `maintenance_state`, for per-tenant cycle bookkeeping. As built, the table is a **future-persistence seam**: it is defined in the schema but the v1 worker does not read or write it — `run_scheduler` keeps `last_cycle_at` in an in-memory `HashMap` instead (see *Internal Logic*), so cycle bookkeeping resets on restart (a benign re-run). The table exists so that cross-restart idle/fallback accuracy can be added later without a schema change.
 
@@ -528,15 +463,12 @@ REMOVE TABLE maintenance_state;
 ```gherkin
 Feature: Maintenance Worker
 
-  Scenario: Happy path — idle-biased consolidation promotes a validated insight
+  Scenario: Happy path — idle-biased maintenance cycle runs supersession, decay, and re-embed
     Given tenant "acme" has had no writes for longer than RECALL_IDLE_QUIET_SECS
-    And the store holds 4 episodic facts sharing the subject "standup at 9am"
-    And RECALL_MAINT_CONSOLIDATE_MIN_EPISODES is 3
-    When run_cycle("acme") runs the consolidation duty
-    And LlmClient::consolidate returns one InsightCandidate whose derived_from lists all 4 episodes
-    Then the candidate passes validation against its source facts
-    And a Consolidated fact is persisted with confidence no greater than the minimum source confidence
-    And the ConsolidationReport reports promoted = 1
+    When run_cycle("acme") runs
+    Then the duties run in order supersede_contradictions, decay_tenant, reembed_tenant
+    And no duty calls any LLM (recall holds no LLM, ADR-015)
+    And the CycleReport carries the per-duty outcome
 
   Scenario: Edge case — high-salience fact survives disuse
     Given a currently-valid fact untouched for 10 days with stability 1.0 and salience 0.9
@@ -560,13 +492,6 @@ Feature: Maintenance Worker
     And superseded_by points to the successor and supersedes points back
     And neither fact is deleted
 
-  Scenario: Error path — unvalidated insight candidate is not promoted
-    Given LlmClient::consolidate returns an InsightCandidate whose derived_from cites a fact not in the scanned group
-    When the consolidation duty validates the candidate
-    Then the candidate is rejected and not persisted
-    And the ConsolidationReport reports rejected_validation = 1
-    And prior memory is unchanged
-
   Scenario: Error path — partial hard delete is never reported as success
     Given a HardDelete job for "fact:018f...abc"
     When MemoryStore::hard_delete fails before returning a DeletionProof
@@ -583,18 +508,19 @@ Feature: Maintenance Worker
 
 #### Performance, Security, Observability
 
-- **Performance targets:** The worker runs **off the synchronous read path**; no maintenance operation may breach the read path's availability (NFR-AV1). Each duty is bounded by `RECALL_MAINT_BATCH_SIZE` (default 200) records per cycle so a single cycle's store load is capped and cannot starve read-path store access. Idle-biased scheduling (SA-CONSOL-01) confines LLM/embedding cost to quiet windows, with a 6 h fallback guaranteeing progress under continuous load. There is no synchronous latency budget for the cycle itself; the only caller-visible latency is the HardDelete proof returned through the Forget sequence, bounded by the C1 `hard_delete` deadline. Memory ceiling: a cycle holds at most `batch_size` facts plus one consolidation group in memory at a time.
-- **Security:** Every store operation is **scoped per tenant** via the maintenance `ScopeContext`; the store's namespace-per-tenant boundary makes cross-tenant maintenance structurally impossible (ADR-011, enforced by `ensure_and_use(ctx.tenant)` on every method). Within a tenant, the maintenance scope (`token_jti = "maintenance"`, empty `user`) is recognised by C1's `is_maintenance_scope` and its read filter (`fact_read_filter`) widens to the whole tenant, so decay, supersession, and verifiable hard delete reach user-private and team-shared facts as well as tenant-shared (RISK-009 resolution) — necessary for these duties and the right to erasure to operate over all of a tenant's memory, while tenant isolation remains structural. The worker holds no end-user credentials and reads no source documents. `maintenance_state` carries `PERMISSIONS NONE` so it is unreachable through user-scoped record permissions. Verifiable hard delete (proof-gated, including derived summaries and embeddings) is the mechanism that satisfies the right to erasure (HLD 06). LLM and embedding API keys are read from env only and never logged; fact content is never written to operational logs.
-- **Observability:** Structured logs with `correlation_id` on every line: `maintenance.cycle.failed{tenant}`, `maintenance.duty.failed{duty}`, `maintenance.consolidate.rejected{reason}`, `maintenance.supersede{superseded_id,successor_id}`, `maintenance.reembed.dim_mismatch{fact_id}`, `maintenance.hard_delete.ok{record_id,embeddings_removed,digest}`, `maintenance.job.failed{kind,job_id,code}`. Metrics (per tenant where noted): `maintenance_cycle_total`, `maintenance_cycle_failed_total`, `maintenance_insights_promoted_total`, `maintenance_insights_rejected_total`, `maintenance_facts_superseded_total`, `maintenance_facts_pruned_total`, `maintenance_facts_reembedded_total`, `maintenance_hard_delete_total`, `maintenance_duty_duration_seconds{duty}`. Trace spans: `maintenance.run_cycle`, `maintenance.consolidate_tenant`, `maintenance.supersede_contradictions`, `maintenance.decay_tenant`, `maintenance.reembed_tenant`, `maintenance.handle_hard_delete`.
+- **Performance targets:** The worker runs **off the synchronous read path**; no maintenance operation may breach the read path's availability (NFR-AV1). Each duty is bounded by `RECALL_MAINT_BATCH_SIZE` (default 200) records per cycle so a single cycle's store load is capped and cannot starve read-path store access. Idle-biased scheduling (SA-MAINT-CADENCE-01) confines embedding/store cost to quiet windows, with a 6 h fallback guaranteeing progress under continuous load. There is no synchronous latency budget for the cycle itself; the only caller-visible latency is the HardDelete proof returned through the Forget sequence, bounded by the C1 `hard_delete` deadline. Memory ceiling: a cycle holds at most `batch_size` facts in memory at a time.
+- **Security:** Every store operation is **scoped per tenant** via the maintenance `ScopeContext`; the store's namespace-per-tenant boundary makes cross-tenant maintenance structurally impossible (ADR-011, enforced by `ensure_and_use(ctx.tenant)` on every method). Within a tenant, the maintenance scope (`token_jti = "maintenance"`, empty `user`) is recognised by C1's `is_maintenance_scope` and its read filter (`fact_read_filter`) widens to the whole tenant, so decay, supersession, and verifiable hard delete reach user-private and team-shared facts as well as tenant-shared (RISK-009 resolution) — necessary for these duties and the right to erasure to operate over all of a tenant's memory, while tenant isolation remains structural. The worker holds no end-user credentials and reads no source documents. `maintenance_state` carries `PERMISSIONS NONE` so it is unreachable through user-scoped record permissions. Verifiable hard delete (proof-gated, including derived summaries and embeddings) is the mechanism that satisfies the right to erasure (HLD 06). The embedding API key is read from env only and never logged; fact content is never written to operational logs.
+- **Observability:** Structured logs with `correlation_id` on every line: `maintenance.cycle.failed{tenant}`, `maintenance.duty.failed{duty}`, `maintenance.supersede{superseded_id,successor_id}`, `maintenance.reembed.dim_mismatch{fact_id}`, `maintenance.hard_delete.ok{record_id,embeddings_removed,digest}`, `maintenance.job.failed{kind,job_id,code}`. Metrics (per tenant where noted): `maintenance_cycle_total`, `maintenance_cycle_failed_total`, `maintenance_facts_superseded_total`, `maintenance_facts_pruned_total`, `maintenance_facts_reembedded_total`, `maintenance_hard_delete_total`, `maintenance_duty_duration_seconds{duty}`. Trace spans: `maintenance.run_cycle`, `maintenance.supersede_contradictions`, `maintenance.decay_tenant`, `maintenance.reembed_tenant`, `maintenance.handle_hard_delete`.
 
 #### Gaps
 
 None. *(Resolved in the Phase 3 reconciliation pass. Detail of how each was closed:)*
 
 - **Config keys — now in Phase 2D.** `RECALL_EMBED_MODEL_VERSION` (string, default `default`),
-  `RECALL_MAINT_BATCH_SIZE` (u32, 500), `RECALL_MAINT_CONSOLIDATE_MIN_EPISODES` (u32, 3),
-  `RECALL_INSIGHT_DECAY_FACTOR` (f64, 0.9 — the `insight_decay_factor`), and `RECALL_REINFORCE_GAIN`
-  (f64, 0.5 — the `reinforce_gain`) are all defined in Phase 2D, owner C7.
+  `RECALL_MAINT_BATCH_SIZE` (u32, 500), and `RECALL_REINFORCE_GAIN` (f64, 0.5 — the `reinforce_gain`)
+  are all defined in Phase 2D, owner C7. The consolidation-only keys
+  (`RECALL_MAINT_CONSOLIDATE_MIN_EPISODES`, `RECALL_INSIGHT_DECAY_FACTOR`) were removed by ADR-015
+  along with server-side consolidation.
 - **`MemoryStore` maintenance surface — now canonical.** `scan_recent_episodes`,
   `scan_contradiction_candidates` (returns `Vec<(Fact, Fact)>`), `scan_decay_candidates(ctx,
   salience_floor, limit)`, `scan_reembed_candidates`, `update_fact_maintenance_fields`,
@@ -603,8 +529,8 @@ None. *(Resolved in the Phase 3 reconciliation pass. Detail of how each was clos
   match).
 - **Contradiction-content predicate — pinned (assumption, `confidence: reduced`).** v1 uses a concrete
   heuristic: two currently-valid facts contradict iff they share ≥1 entity **and** their `content`
-  carries the same `(subject, predicate)` pair (for triple-shaped content) with a differing `object`,
-  **or** the consolidation LLM flags them as conflicting during a cycle. The superseded *side* is
+  carries the same `(subject, predicate)` pair (for triple-shaped content) with a differing `object`.
+  The superseded *side* is
   chosen deterministically (later `valid_from` wins → higher `confidence` → lexicographically greater
   `id`). This is a component-internal rule (ADR-002/ADR-007); it is tunable and does not change
   architecture, so it is recorded as an assumption rather than an open question.
@@ -612,4 +538,4 @@ None. *(Resolved in the Phase 3 reconciliation pass. Detail of how each was clos
   activity the worker can read itself — the most-recent `ingested_at` across the tenant's facts
   (via a bounded `scan_recent_episodes(ctx, since = now - idle_quiet, limit = 1)` probe) and the
   presence of Pending jobs for the tenant — rather than a `last_write_at` field written by C4. The
-  6 h fallback timer (`RECALL_CONSOLIDATE_MAX_INTERVAL_SECS`) guarantees progress regardless.
+  6 h fallback timer (`RECALL_MAINT_MAX_INTERVAL_SECS`) guarantees progress regardless.

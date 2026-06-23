@@ -207,22 +207,6 @@ impl EmbeddingClient for FixedEmbed {
     }
 }
 
-/// An LLM never reached by these unit tests.
-struct NoopLlm;
-
-#[async_trait]
-impl LlmClient for NoopLlm {
-    async fn extract(&self, _c: &Json) -> Result<Vec<ExtractedFact>, ProviderError> {
-        Ok(vec![])
-    }
-    async fn consolidate(
-        &self,
-        _e: &[Fact],
-    ) -> Result<Vec<crate::types::ports::InsightCandidate>, ProviderError> {
-        Ok(vec![])
-    }
-}
-
 fn cfg() -> WritePipelineConfig {
     WritePipelineConfig {
         trust_admit: 0.7,
@@ -244,7 +228,6 @@ fn pipeline(pii: Vec<PiiSpan>) -> WritePipeline {
         store: Arc::new(NoopStore),
         queue: Arc::new(NoopQueue),
         embed: Arc::new(FixedEmbed(DIM as usize)),
-        llm: Arc::new(NoopLlm),
         pii: Arc::new(FixedPii(pii)),
         db: None,
         cfg: cfg(),
@@ -434,18 +417,26 @@ fn derive_fact_id_is_deterministic_with_key_and_random_without() {
     assert!(a.starts_with("fact:"));
 }
 
-// --- extract (agent-stated bypass) ------------------------------------------------------------
+// --- intake (structured content, no LLM; ADR-015) ---------------------------------------------
 
-#[tokio::test]
-async fn extract_agent_stated_bypasses_llm() {
+#[test]
+fn intake_wraps_structured_content() {
     let p = pipeline(vec![]);
     let content = serde_json::json!({"subject": "team:alpha", "predicate": "owns", "object": "table:orders"});
-    let facts = p.extract(&content, true).await.unwrap();
+    let facts = p.intake(&content, None);
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].confidence, 1.0);
     assert_eq!(facts[0].memory_class, MemoryClass::Episodic);
     // Mentions derived from subject/object.
     assert_eq!(facts[0].entities.len(), 2);
+}
+
+#[test]
+fn intake_honours_requested_memory_class() {
+    let p = pipeline(vec![]);
+    let content = serde_json::json!({"subject": "team:alpha", "predicate": "owns", "object": "table:orders"});
+    let facts = p.intake(&content, Some(MemoryClass::Semantic));
+    assert_eq!(facts[0].memory_class, MemoryClass::Semantic);
 }
 
 // --- resolve_entities (create-new tier) -------------------------------------------------------

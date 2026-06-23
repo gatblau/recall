@@ -1,6 +1,6 @@
 # 08 — External Interfaces
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 Names and shapes only. Exact JSON schemas, field types, error codes, and status-code tables belong in
 `/spec`. All endpoints are **new**. All require an OIDC bearer token except the unauthenticated

@@ -98,33 +98,6 @@ fn is_prune_candidate_cases() {
 }
 
 #[test]
-fn insight_confidence_never_outranks_sources() {
-    let factor = 0.9;
-    // (candidate_conf, sources, expected)
-    let cases = [
-        // Capped by the minimum source confidence (0.6), then decayed: 0.6 * 0.9 = 0.54.
-        (0.95, vec![0.8, 0.6, 0.7], 0.54),
-        // Capped by the candidate's own (lower) confidence: 0.4 * 0.9 = 0.36.
-        (0.4, vec![0.8, 0.9], 0.36),
-        // Equal sources and candidate: 0.5 * 0.9 = 0.45.
-        (0.5, vec![0.5, 0.5], 0.45),
-    ];
-    for (cand, sources, expected) in &cases {
-        let got = insight_confidence(*cand, sources, factor);
-        assert!((got - expected).abs() < 1e-9, "insight_confidence got {got}, want {expected}");
-        // The cap invariant: the insight never exceeds the minimum source confidence.
-        let min_source = sources.iter().copied().fold(f64::INFINITY, f64::min);
-        assert!(got <= min_source + 1e-9, "insight {got} outranks min source {min_source}");
-        assert!(got <= *cand + 1e-9, "insight {got} outranks candidate {cand}");
-    }
-    // Empty sources: capped only by the candidate, decayed; never panics.
-    let got = insight_confidence(0.8, &[], factor);
-    assert!((got - 0.72).abs() < 1e-9, "empty-source insight = {got}");
-    // Result is always clamped into [0,1].
-    assert!((0.0..=1.0).contains(&insight_confidence(2.0, &[2.0], 1.0)));
-}
-
-#[test]
 fn reinforce_raises_stability_and_resets_clock() {
     let now = dt("2026-06-20T12:00:00.000Z");
     // (stability, gain, expected_stability)

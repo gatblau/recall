@@ -1,6 +1,6 @@
 # 09 — Architectural Decisions, Assumptions & Open Questions
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 ## Architectural Decisions
 
@@ -166,8 +166,9 @@
   read path **does** perform exactly two non-LLM **model inferences**: (1) embedding the incoming query
   (semantic recall needs a query vector, which a novel query cannot have cached), and (2) a
   cross-encoder **rerank** of the bounded stage-1 candidate set. Each gets an explicit latency
-  sub-budget inside NFR-P2; only extraction and consolidation (true LLM calls) run asynchronously off
-  the path.
+  sub-budget inside NFR-P2. Extraction is performed by the agent and server-side consolidation is
+  dropped (ADR-015); `recall` makes no LLM call at all. The two read-path model inferences
+  (query-embed, rerank) are unaffected.
 - **Context.** Earlier draft prose described the embedding provider as "off the read path /
   asynchronous" and the reranker as "off the read-path candidate set", which contradicted both the
   architecture (stage-2 rerank is synchronous — `good-mem.md` §7.2) and the need to embed each query at
@@ -226,6 +227,27 @@
 - **Alternatives considered.** Keep ADR-013 recall-side check (rejected — unreachable broker). Keep it
   behind a deployment flag (rejected per the directive — `recall` makes no broker calls). Have the broker
   call `recall` to push freshness (rejected — inverts the topology and re-adds orchestration to `recall`).
+
+### ADR-015: Recall is LLM-free — extraction and consolidation are the agent's responsibility
+- **Decision.** `recall` holds **no LLM dependency**. The write path performs **no LLM extraction** —
+  callers submit structured, agent-asserted facts. **Server-side episodic→semantic consolidation is
+  dropped**; the agent distils insights with its own LLM and writes them back as agent-stated
+  `consolidated` facts. Removed: the `LlmClient` port, the `HttpLlmClient` adapter, `RECALL_LLM_URL` /
+  `RECALL_LLM_API_KEY`, the `Consolidate` job kind, and `InsightCandidate`. The embedding and reranker
+  inferences (non-LLM, ADR-012) are **retained**.
+- **Context.** Completes ADR-014's passive-store direction. The agent already runs an LLM; extraction
+  and synthesis are reasoning that belongs with the agent, not the memory store. Removing the LLM
+  simplifies deployment (no LLM provider, endpoint, or key) and shrinks the ingest trust surface (no
+  model interpreting untrusted source content on the way in).
+- **Consequences.** `POST /v1/memories` accepts only structured assertions (breaking). The write
+  pipeline keeps its non-LLM steps (filter, canonicalise, entity-resolve, score, PII scan, write-gate,
+  embed+persist). The maintenance worker keeps supersession, graceful decay, re-embed (via the embedding
+  provider), and verifiable hard delete, and loses consolidation. The `consolidated` `MemoryClass` and
+  `derived_from` remain for agent-written insights. recall is generative-model-free; only the retrieval
+  embedding/reranker model inferences remain.
+- **Alternatives considered.** Relocate consolidation to a separate worker (rejected — adds a deployable
+  and keeps an LLM in the system). LLM-free heuristic consolidation (rejected — weak insights). Keep
+  server-side LLM extraction/consolidation (rejected — contradicts ADR-014's passive-store direction).
 
 ## Assumptions
 

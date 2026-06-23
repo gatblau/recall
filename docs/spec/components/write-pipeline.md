@@ -3,15 +3,15 @@
 **File:** `src/write_pipeline` | **Package:** `recall::write_pipeline` | **Phase:** 3 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.5.0
+> **derivedFromHld:** 0.6.0
 
 #### Purpose
 
-The Write Pipeline is the asynchronous consumer of `ExtractFact` work jobs from the durable work queue. It turns raw, untrusted `remember` content into a clean, scoped, provenance-tagged Fact in the Memory Store, or into a quarantined / rejected record when the content cannot be trusted. For each claimed job it runs eight ordered steps — noise filtering, fact extraction, normalisation, entity resolution, scoring, PII scanning, the write gate, and embedding-then-persist. It never runs on the read path (ADR-004): a slow or failed write is retried with backoff behind the queue and is dead-lettered after the attempt cap, and a write never blocks a read. It is the component that enforces ADR-008 (write-gate trust validation and untrusted-data separation), SA-PII-01 (PII redaction / flagging), and the data-minimisation obligation (store structured assertions, drop low-signal noise).
+The Write Pipeline is the asynchronous consumer of `ExtractFact` work jobs from the durable work queue. It turns a structured, agent-asserted `remember` payload into a clean, scoped, provenance-tagged Fact in the Memory Store, or into a quarantined / rejected record when the content cannot be trusted. For each claimed job it runs eight ordered steps — noise filtering, structured-content intake, normalisation, entity resolution, scoring, PII scanning, the write gate, and embedding-then-persist. It never runs on the read path (ADR-004): a slow or failed write is retried with backoff behind the queue and is dead-lettered after the attempt cap, and a write never blocks a read. It is the component that enforces ADR-008 (write-gate trust validation and untrusted-data separation), SA-PII-01 (PII redaction / flagging), and the data-minimisation obligation (store structured assertions, drop low-signal noise).
 
 #### Approach
 
-The component is a **linear step pipeline driven by a claim/lease loop**, not a state machine and not a per-step actor graph. One async task per worker calls `WorkQueue::claim(&[JobKind::ExtractFact], lease)`; each claimed job flows through the eight step functions in fixed order, and the first step that decides the job is finished (filtered as noise, rejected by the gate) short-circuits to `WorkQueue::complete`. This was chosen over a state-machine-per-job (rejected — the steps are a fixed acyclic sequence with no re-entry, so a state machine adds bookkeeping with no branching benefit) and over fanning each step to its own queue stage (rejected — every step shares the same job context and there is no independent scaling need across steps; multi-stage queuing would multiply queue round-trips against SA-LAT budgets for no gain). Entity resolution is a **three-tier escalation** (deterministic rules → ML similarity → create-new) so the cheap tiers settle the common cases and a genuinely ambiguous identity yields a fresh entity rather than risking a wrong merge; the HLD's third tier names LLM adjudication, but `LlmClient` exposes no entity-adjudication method, so v1 substitutes create-new and defers LLM adjudication (documented in *Gaps* as a `confidence: reduced` assumption). The component owns only the `quarantine` table; the `fact` and `entity` tables are owned by C1 and written through the `MemoryStore` trait.
+The component is a **linear step pipeline driven by a claim/lease loop**, not a state machine and not a per-step actor graph. One async task per worker calls `WorkQueue::claim(&[JobKind::ExtractFact], lease)`; each claimed job flows through the eight step functions in fixed order, and the first step that decides the job is finished (filtered as noise, rejected by the gate) short-circuits to `WorkQueue::complete`. This was chosen over a state-machine-per-job (rejected — the steps are a fixed acyclic sequence with no re-entry, so a state machine adds bookkeeping with no branching benefit) and over fanning each step to its own queue stage (rejected — every step shares the same job context and there is no independent scaling need across steps; multi-stage queuing would multiply queue round-trips against SA-LAT budgets for no gain). Entity resolution is a **three-tier escalation** (deterministic rules → ML similarity → create-new) so the cheap tiers settle the common cases and a genuinely ambiguous identity yields a fresh entity rather than risking a wrong merge; recall holds no LLM (ADR-015), so create-new is the terminal tier by design (not a deferral). The component owns only the `quarantine` table; the `fact` and `entity` tables are owned by C1 and written through the `MemoryStore` trait.
 
 #### Shared Context
 
@@ -113,7 +113,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
+pub enum JobKind { ExtractFact, ReEmbedFact, HardDelete }  // ReReadSource removed by ADR-014; Consolidate removed by ADR-015
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,30 +150,20 @@ pub trait EmbeddingClient: Send + Sync {              // impl: HTTP adapter
 }
 
 #[async_trait]
-pub trait LlmClient: Send + Sync {                    // impl: HTTP adapter (async path only)
-    async fn extract(&self, content: &serde_json::Value) -> Result<Vec<ExtractedFact>, ProviderError>;
-    // consolidate(...) is consumed by C7, not by this component.
-}
-
-#[async_trait]
-pub trait PiiDetector: Send + Sync {                  // impl: model/heuristic adapter
+pub trait PiiDetector: Send + Sync {                  // impl: in-process deterministic detector
     async fn scan(&self, content: &serde_json::Value) -> Result<Vec<PiiSpan>, ProviderError>;
 }
 ```
 
-`StoreError`, `QueueError`, and `ProviderError` are typed errors owned by C1 / C2 / the provider adapters and referenced here by name. `ExtractedFact`, `EntityMention`, and `PiiSpan` are defined in `src/types/ports.rs` (the §2C.6 trait surface, because they cross the `LlmClient` / `PiiDetector` trait boundary) and are restated in full in this component's *Public Interface*.
+`StoreError`, `QueueError`, and `ProviderError` are typed errors owned by C1 / C2 / the provider adapters and referenced here by name. `ExtractedFact`, `EntityMention`, and `PiiSpan` are defined in `src/types/ports.rs` (the §2C.6 trait surface, because they cross the `PiiDetector` trait boundary) and are restated in full in this component's *Public Interface*.
 
-**Provider wire contracts (as built in `src/providers/mod.rs`).** The three providers this component consumes are thin `reqwest` POST adapters with no domain logic; the concrete JSON request / response shapes below are the wire contract the integration-suite wiremock stubs honour. All POST with `Content-Type: application/json` and, where an API key is configured, `Authorization: Bearer <key>`; each call carries a uniform 10 s timeout. A `reqwest` timeout maps to `ProviderError::Timeout`, a non-2xx status to `ProviderError::Status(code)`, a transport failure to `ProviderError::Transport`, and a malformed body to `ProviderError::Malformed`.
+**Provider wire contracts (as built in `src/providers/mod.rs`).** The only network provider this component consumes is the embedding provider — a thin `reqwest` POST adapter with no domain logic; the concrete JSON request / response shape below is the wire contract the integration-suite wiremock stubs honour. It POSTs with `Content-Type: application/json` and, where an API key is configured, `Authorization: Bearer <key>`; the call carries a uniform 10 s timeout. A `reqwest` timeout maps to `ProviderError::Timeout`, a non-2xx status to `ProviderError::Status(code)`, a transport failure to `ProviderError::Transport`, and a malformed body to `ProviderError::Malformed`.
 
 - **Embedding** — `POST {RECALL_EMBED_URL}/embeddings`
   - Request: `{ "model": "<RECALL_EMBED_MODEL_VERSION>", "input": ["text", ...] }`
   - Response: `{ "embeddings": [[f32, ...], ...] }` — one vector per input, each of `RECALL_EMBED_DIM`.
-- **LLM extract** — `POST {RECALL_LLM_URL}/extract`
-  - Request: `{ "content": <json object> }`
-  - Response: `{ "facts": [ { "content": <json object>, "entity_mentions": [ { "surface_form": "..", "mention_type": "person"|null } ], "memory_class": "episodic"|"semantic"|"consolidated", "asserted_valid_from": "<rfc3339>"|null, "extractor_confidence": f64 } ] }`. The adapter maps each wire fact onto the canonical `ExtractedFact`: `entity_mentions` → `entities`, `surface_form` → `EntityMention.surface`, `mention_type` → `EntityMention.canonical_name`, `extractor_confidence` → `confidence`; an absent / unrecognised `memory_class` defaults to `episodic`; `asserted_valid_from` is accepted on the wire but not carried onto the domain type (`valid_from` is server-set at persist, step 8).
-- **PII scan** — `POST {RECALL_PII_URL or RECALL_LLM_URL}/pii/scan` (no dedicated PII config key exists in §2D, so the detector POSTs to the LLM base URL with the LLM API key — the PII model is co-located with the extraction model in v1)
-  - Request: `{ "content": <json object> }`
-  - Response: `{ "spans": [ { "json_pointer": "/path", "start": u32, "end": u32, "pii_type": "email"|"phone"|.., "confidence": f64 } ] }` — wire field names match `PiiSpan` exactly.
+
+**PII detection (in-process, ADR-015).** PII detection is an **in-process deterministic detector** (the default `PiiDetector` impl) — regex/pattern matching for structured identifiers (email, phone, card-via-Luhn, IP, national-id), confidence by pattern strength; no network call, no endpoint or key (ADR-015). The `PiiDetector` trait remains a DI seam so a model-backed detector can be injected if a deployment needs one. There is no PII wire contract: the default detector never leaves the process.
 
 **Config keys used by this component (2D), with the env var, type, and default:**
 
@@ -202,22 +192,23 @@ The component exposes one runtime entrypoint (the consumer loop), `process`, and
 **Types defined by this component:**
 
 ```rust
-/// The LLM extractor's output shape, pre-persistence. One per asserted fact.
+/// The internal pre-persistence fact shape. One per asserted fact.
 /// This is NOT a stored Fact: it carries no id, no scores, no validity, no scope —
 /// those are assigned by later pipeline steps. Defined in `src/types/ports.rs`
-/// (the §2C.6 trait surface) because `LlmClient::extract` returns it.
+/// (the §2C.6 trait surface). Produced internally by `intake` from the structured
+/// agent-asserted content; recall runs no extractor (ADR-015).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ExtractedFact {
     pub content: serde_json::Value,          // structured assertion (JSON object), not free text
-    pub entities: Vec<EntityMention>,        // raw entity references to resolve (>=1) [wire name: entity_mentions]
+    pub entities: Vec<EntityMention>,        // raw entity references to resolve (>=1)
     pub memory_class: MemoryClass,           // proposed class; procedural is impossible (enum)
-    pub confidence: f64,                     // [0,1] the LLM's own confidence [wire name: extractor_confidence]
+    pub confidence: f64,                     // [0,1] intake confidence (1.0 for agent-asserted content)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EntityMention {
-    pub surface: String,                     // 1..=512 chars, the text as it appeared [wire name: surface_form]
-    pub canonical_name: Option<String>,      // optional coarse type hint, e.g. "person", "team" [wire name: mention_type]
+    pub surface: String,                     // 1..=512 chars, the text as it appeared
+    pub canonical_name: Option<String>,      // optional coarse type hint, e.g. "person", "team"
 }
 
 /// A PII span returned by PiiDetector::scan, defined in `src/types/ports.rs`.
@@ -254,7 +245,6 @@ pub struct WritePipeline {
     store: Arc<dyn MemoryStore>,
     queue: Arc<dyn WorkQueue>,
     embed: Arc<dyn EmbeddingClient>,
-    llm: Arc<dyn LlmClient>,
     pii: Arc<dyn PiiDetector>,
     // Shared SurrealDB handle for the C4-owned `quarantine` table (the quarantine sink); `None`
     // disables quarantining (the gate then surfaces a defended `quarantine sink not wired` error).
@@ -283,7 +273,6 @@ impl WritePipeline {
         store: Arc<dyn MemoryStore>,
         queue: Arc<dyn WorkQueue>,
         embed: Arc<dyn EmbeddingClient>,
-        llm: Arc<dyn LlmClient>,
         pii: Arc<dyn PiiDetector>,
         db: Surreal<Db>,
         cfg: WritePipelineConfig,
@@ -304,9 +293,9 @@ impl WritePipeline {
     /// Step 1. True => content is empty or low-signal and the job is completed as noise.
     pub fn filter_noise(&self, content: &serde_json::Value) -> bool;
 
-    /// Step 2. Extract structured facts. If agent_stated, bypass the LLM and wrap the
-    /// content directly as a single asserted ExtractedFact.
-    pub async fn extract(&self, content: &serde_json::Value, agent_stated: bool)
+    /// Step 2. Wrap the structured agent-asserted content directly as a single
+    /// ExtractedFact. No provider call (ADR-015 — recall holds no LLM).
+    pub async fn intake(&self, content: &serde_json::Value, memory_class: Option<MemoryClass>)
         -> Result<Vec<ExtractedFact>, AppError>;
 
     /// Step 3. Canonicalise content (key order, whitespace, unicode NFC — currently identity, see Internal Logic).
@@ -352,9 +341,8 @@ impl WritePipeline {
   "id": "work_job:018f3a2b-7c41-7e90-9d22-1a2b3c4d5e6f",
   "kind": "extract_fact",
   "payload": {
-    "content": { "text": "Team Alpha owns the orders table." },
-    "source": { "origin_ref": "doc://wiki/ownership", "modification_marker": "W/\"abc\"" },
-    "agent_stated": false
+    "content": { "subject": "Team Alpha", "predicate": "owns", "object": "the orders table" },
+    "source": { "origin_ref": "doc://wiki/ownership", "modification_marker": "W/\"abc\"" }
   },
   "scope": { "tenant": "acme", "team": "platform", "user": "u-77" },
   "idempotency_key": "ik-2026-06-20-001",
@@ -397,19 +385,19 @@ The job is then marked `complete`; `WriteOutcome::Persisted`.
 
 `process(ctx, job)` runs the steps below in order. Each step states what it does, which dependency it calls, which errors it can raise, and what it logs. All logs are structured and carry `correlation_id` (from `job.scope`/`ctx`), `job_id`, and `tenant`; content values and PII are never logged.
 
-0. **Validate job payload.** Deserialise `job.payload` into `{ content: Value, source: Option<SourceInput>, agent_stated: bool }`. If `job.kind != ExtractFact`, raise `AppError::Validation` (terminal — wrong consumer claimed it; this is impossible under the claim filter but defended). If `content` is absent or not a JSON object, raise `AppError::Validation` (terminal). Build the internal `ScopeContext` from `job.scope`. Logs: `write.job.claimed` with `job_id`, `tenant`, `attempts`.
+0. **Validate job payload.** Deserialise `job.payload` into `{ content: Value, source: Option<SourceInput>, memory_class: Option<MemoryClass> }`. If `job.kind != ExtractFact`, raise `AppError::Validation` (terminal — wrong consumer claimed it; this is impossible under the claim filter but defended). If `content` is absent or not a JSON object, raise `AppError::Validation` mapped to `VAL_INVALID_BODY` (terminal — the payload must carry a structured assertion object). Build the internal `ScopeContext` from `job.scope`. Logs: `write.job.claimed` with `job_id`, `tenant`, `attempts`.
 
 1. **Filter noise** (`filter_noise`). Drop the job as noise when, after trimming, the serialised `content` is empty, is an empty object/array, or its total non-whitespace string length across all string values is `< 3` characters. On noise: log `write.filtered_noise`, call `WorkQueue::complete(job.id)`, return `WriteOutcome::FilteredNoise`. Errors: none (pure). This is the data-minimisation step (HLD 06).
 
-2. **Extract** (`extract`). If `agent_stated == true`, **bypass the LLM**: wrap `content` as a single `ExtractedFact` with `entities` derived from the content's referenced entities (a deterministic `scan_entity_mentions` scan over the well-known `subject`/`object` string fields), `memory_class = Episodic`, and `confidence = 1.0` (the caller asserts it directly). Otherwise call `LlmClient::extract(&content)` (single-pass) → `Vec<ExtractedFact>`. Errors: `ProviderError` → `AppError::Provider` (retryable iff timeout/5xx; non-retryable on a 4xx-class provider rejection — see Error Table). If extraction returns an empty vector, complete the job as `FilteredNoise` (nothing salient extracted). Logs: `write.extracted` with `fact_count`. **Security:** the extracted content is treated as data, never executed or interpreted as instructions to the pipeline.
+2. **Intake** (`intake`). Wrap the structured agent-asserted `content` as a single `ExtractedFact` with `entities` derived from the content's referenced entities (a deterministic `scan_entity_mentions` scan over the well-known `subject`/`object` string fields), `memory_class` taken from the request's `memory_class` (else `Episodic`), and `confidence = 1.0` (the caller asserts it directly). **No LLM call** (ADR-015 — recall holds no LLM); there is no provider-error path here. If the wrapped content yields no salient assertion (empty after intake), complete the job as `FilteredNoise`. Logs: `write.intake` with `fact_count`. **Security:** the content is treated as data, never executed or interpreted as instructions to the pipeline.
 
    Steps 3–8 then run **once per `ExtractedFact`** in the returned vector; each produces its own gate decision and persistence outcome. A failure on one fact aborts the whole job as retryable (the queue replays all facts; persistence is idempotent on the derived fact id — see step 8).
 
 3. **Normalise** (`normalise`). Canonicalise the `ExtractedFact.content`: sort object keys (recursively, lexicographic), collapse internal whitespace runs to single spaces and trim string values, and apply Unicode NFC normalisation; each `EntityMention.surface` is whitespace-collapsed the same way. Pure; no dependency. Errors: none. Logs: none (per-fact, high volume). **Assumption (NFC):** the as-built `nfc` helper is the identity function — input is expected to arrive already NFC-composed, so the canonicalisation that affects recall is key order plus whitespace; full Unicode decomposition / recomposition is deferred to avoid a heavy dependency. This is a documented assumption, not a gap.
 
-4. **Entity-resolve** (`resolve_entities`) — three-tier escalation, returning `>=1` entity ids. For each `EntityMention`: (a) **Rules tier** — normalise the `surface` (NFC, lowercase, trim, collapse whitespace, strip leading/trailing ASCII punctuation; a normalised-empty mention is skipped) and look up an existing `Entity` by exact canonical-name or alias match within `ctx` via `MemoryStore::find_entity_by_name`. On a unique hit, resolve to it; on **multiple** exact hits, deterministically pick the lexicographically-smallest entity id rather than guess (a later maintenance merge folds the duplicates, C7). (b) **ML tier** — on no exact hit, run a second `find_entity_by_name` against the *raw* surface form (a case / punctuation variant) and score each candidate's canonical name against the normalised surface with a character-bigram Sørensen–Dice coefficient; a single candidate at or above the similarity admit threshold (`ML_SIMILARITY_ADMIT = 0.92`) resolves, otherwise escalate. (c) **create-new tier (v1)** — on ambiguity, the mention is resolved by creating a **new** `Entity` via `MemoryStore::put_entity` (canonical_name = normalised surface form, the original surface form added to `aliases`) — never merging into an existing entity without an above-threshold match, and **never silently overwriting** an existing entity (HLD 04). The HLD names an LLM adjudication tier (`rules→ML→LLM`), but `LlmClient` exposes no entity-adjudication method; v1 substitutes create-new and defers LLM adjudication (recorded as the `confidence: reduced` assumption in *Gaps* and surfaced to HLD `10-risks.md` via the Phase 3.5 HLD-impact-pass). Duplicate entities created this way are folded later by the C7 Maintenance Worker via `MemoryStore::merge_entities`. If, after processing every mention, no entity id was produced (the extractor offered no usable mention), the pipeline synthesises a single anchor entity from the content (a normalised `subject` string, else the first non-empty string leaf) so a salient assertion is still anchored rather than dropped; only when that synthesis also yields an empty name does it raise `AppError::Validation` (terminal — a fact must connect `>=1` entity, 2C.2). Errors: `StoreError` → `AppError::Store` (retryable). Logs: `write.entities.resolved` with `entity_count`, `created_count`.
+4. **Entity-resolve** (`resolve_entities`) — three-tier escalation, returning `>=1` entity ids. For each `EntityMention`: (a) **Rules tier** — normalise the `surface` (NFC, lowercase, trim, collapse whitespace, strip leading/trailing ASCII punctuation; a normalised-empty mention is skipped) and look up an existing `Entity` by exact canonical-name or alias match within `ctx` via `MemoryStore::find_entity_by_name`. On a unique hit, resolve to it; on **multiple** exact hits, deterministically pick the lexicographically-smallest entity id rather than guess (a later maintenance merge folds the duplicates, C7). (b) **ML tier** — on no exact hit, run a second `find_entity_by_name` against the *raw* surface form (a case / punctuation variant) and score each candidate's canonical name against the normalised surface with a character-bigram Sørensen–Dice coefficient; a single candidate at or above the similarity admit threshold (`ML_SIMILARITY_ADMIT = 0.92`) resolves, otherwise escalate. (c) **create-new tier (v1)** — on ambiguity, the mention is resolved by creating a **new** `Entity` via `MemoryStore::put_entity` (canonical_name = normalised surface form, the original surface form added to `aliases`) — never merging into an existing entity without an above-threshold match, and **never silently overwriting** an existing entity (HLD 04). The HLD's third tier named LLM adjudication, but recall has no LLM (ADR-015), so create-new is the terminal tier by design (not a deferral). Duplicate entities created this way are folded later by the C7 Maintenance Worker via `MemoryStore::merge_entities`. If, after processing every mention, no entity id was produced (the extractor offered no usable mention), the pipeline synthesises a single anchor entity from the content (a normalised `subject` string, else the first non-empty string leaf) so a salient assertion is still anchored rather than dropped; only when that synthesis also yields an empty name does it raise `AppError::Validation` (terminal — a fact must connect `>=1` entity, 2C.2). Errors: `StoreError` → `AppError::Store` (retryable). Logs: `write.entities.resolved` with `entity_count`, `created_count`.
 
-5. **Score** (`score`). Compute `salience` and `confidence`, each clamped to `[0,1]` (SA-SCORE-01). `confidence = clamp01(ef.confidence * source_trust_factor)` where `source_trust_factor = 0.5 + 0.5 * source_trust.clamp(0,1)` (source-less / agent-stated → `source_trust = 1.0`). `salience` is a bounded heuristic in `[0,1]` from content richness: base `0.3`, `+0.15` per entity mention (mention weight capped at `0.45`), `+0.2` when the content names a `predicate` / `relation` / `verb` field. Pure. Errors: none. Logs: none.
+5. **Score** (`score`). Compute `salience` and `confidence`, each clamped to `[0,1]` (SA-SCORE-01). `confidence = clamp01(ef.confidence * source_trust_factor)` where `source_trust_factor = 0.5 + 0.5 * source_trust.clamp(0,1)` (a source-less agent assertion → `source_trust = 1.0`). `salience` is a bounded heuristic in `[0,1]` from content richness: base `0.3`, `+0.15` per entity mention (mention weight capped at `0.45`), `+0.2` when the content names a `predicate` / `relation` / `verb` field. Pure. Errors: none. Logs: none.
 
 6. **PII scan** (`pii_scan`). Call `PiiDetector::scan(&content)` → `Vec<PiiSpan>`. For each span with `confidence >= cfg.pii_redact_conf`: locate the string via `json_pointer`, replace bytes `[start,end)` with the literal `‹redacted:‹{pii_type}››` (SA-PII-01). If any span has `confidence < cfg.pii_redact_conf`, set `pii_review = true`. Return `(redacted_content, pii_review)`. Errors: `ProviderError` → `AppError::Provider` (retryable iff timeout/5xx). Logs: `write.pii.scanned` with `redacted_count`, `flagged_count` — never the span text or type values beyond counts.
 
@@ -493,8 +481,8 @@ The Write Pipeline has **no HTTP surface** — these errors are the `AppError` v
 | `ExtractedFact.memory_class` is procedural (cannot occur via the enum; defended) | 400 | `VAL_UNSUPPORTED_CLASS` | `{"error":{"code":"VAL_UNSUPPORTED_CLASS","message":"procedural memory is not supported","correlation_id":"<uuid>"}}` | `fail(retryable=false)` → immediate dead-letter |
 | `MemoryStore` unreachable (put_fact / entity upsert / quarantine) | 503 | `STORE_UNAVAILABLE` | `{"error":{"code":"STORE_UNAVAILABLE","message":"memory store unavailable","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry, dead-letter after max attempts |
 | `MemoryStore` operation timed out | 504 | `STORE_TIMEOUT` | `{"error":{"code":"STORE_TIMEOUT","message":"memory store timed out","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
-| LLM / embedding / PII provider timed out | 504 | `PROVIDER_TIMEOUT` | `{"error":{"code":"PROVIDER_TIMEOUT","message":"upstream provider timed out","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
-| LLM / embedding / PII provider returned an error (5xx) | 502 | `PROVIDER_ERROR` | `{"error":{"code":"PROVIDER_ERROR","message":"upstream provider error","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
+| Embedding provider timed out | 504 | `PROVIDER_TIMEOUT` | `{"error":{"code":"PROVIDER_TIMEOUT","message":"upstream provider timed out","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
+| Embedding provider returned an error (5xx) | 502 | `PROVIDER_ERROR` | `{"error":{"code":"PROVIDER_ERROR","message":"upstream provider error","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
 | Work queue unreachable when completing/failing a job | 503 | `QUEUE_UNAVAILABLE` | `{"error":{"code":"QUEUE_UNAVAILABLE","message":"work queue unavailable","correlation_id":"<uuid>"}}` | loop logs and re-claims; lease expiry returns the job to `pending` |
 | Unexpected internal fault (panic-safety boundary, serialisation bug) | 500 | `INTERNAL` | `{"error":{"code":"INTERNAL","message":"internal error","correlation_id":"<uuid>"}}` | `fail(retryable=true)` → backoff retry |
 
@@ -505,22 +493,22 @@ Non-error terminal outcomes (not failures, no error code): **FilteredNoise** and
 ```gherkin
 Feature: Write Pipeline
 
-  Scenario: Happy path — trusted content is extracted, scored, and persisted
-    Given an ExtractFact job whose content is "Team Alpha owns the orders table" with a trusted source
-    And the LLM extractor returns one ExtractedFact with two entity mentions
-    And the PII detector returns no spans
+  Scenario: Happy path — structured content is wrapped, scored, and persisted (no LLM)
+    Given an ExtractFact job whose content is a structured assertion object with a trusted source
+    And no LLM is wired (recall holds no LLM, ADR-015)
+    And the in-process PII detector returns no spans
     When the Write Pipeline processes the job
-    Then the write gate computes a trust score >= RECALL_TRUST_ADMIT (0.7)
+    Then the content is wrapped as a single ExtractedFact with confidence 1.0
+    And the write gate computes a trust score >= RECALL_TRUST_ADMIT (0.7)
     And the fact is embedded with a vector of length RECALL_EMBED_DIM
     And MemoryStore::put_fact is called once with confidence and salience in [0,1]
     And the job is completed with outcome Persisted
 
-  Scenario: Edge case — agent-stated content bypasses extraction
-    Given an ExtractFact job with agent_stated = true and a structured content object
+  Scenario: Edge case — non-object content is rejected as invalid
+    Given an ExtractFact job whose content is a JSON string, not an object
     When the Write Pipeline processes the job
-    Then LlmClient::extract is NOT called
-    And the content is taken as a single asserted ExtractedFact with confidence 1.0
-    And the fact is persisted with outcome Persisted
+    Then process returns AppError mapping to status 400 with code VAL_INVALID_BODY
+    And WorkQueue::fail is called with retryable = false
 
   Scenario: Edge case — empty/low-signal content is filtered as noise
     Given an ExtractFact job whose content has total non-whitespace string length < 3 characters
@@ -567,7 +555,7 @@ Feature: Write Pipeline
 
   Scenario: Error path — provider timeout retries then dead-letters at the attempt cap
     Given an ExtractFact job on its 5th attempt with RECALL_JOB_MAX_ATTEMPTS = 5
-    And LlmClient::extract times out
+    And EmbeddingClient::embed times out
     When the Write Pipeline processes the job
     Then process returns AppError mapping to status 504 with code PROVIDER_TIMEOUT
     And WorkQueue::fail is called with retryable = true
@@ -584,8 +572,8 @@ Feature: Write Pipeline
 #### Performance, Security, Observability
 
 - **Performance targets.** Throughput-oriented and entirely **off the read path** (ADR-004); no read-path latency NFR (NFR-P2) applies. Per-job wall-clock budget: **`per_job_budget` = 30 s** (config), covering one LLM extract call, the PII scan, and one embed call plus store writes — each external call carries its own timeout (`tokio::time::timeout`) so the budget is bounded even when a provider hangs. Worker concurrency is a deployment knob (default: one consumer task; horizontally scalable because claim/lease is atomic in C2). Steady-state target: sustain the enqueue rate of the write class (SA-RATE-01 write limit, default 30 req/min/subject) per worker with headroom; backpressure is implicit — unclaimed jobs wait in the queue, they are never dropped. Memory ceiling per in-flight job: bounded by `RECALL_MAX_BODY_BYTES` (1 MiB) content plus one embedding vector (`embed_dim * 4` bytes).
-- **Security.** **Untrusted-source content is data, never instructions** (ADR-008): the imperative-pattern detector caps instruction-like content strictly below the quarantine floor so it can never be admitted; extracted content is never evaluated, executed, or used to steer pipeline control flow. The write gate (SA-WGATE-01) is the memory-poisoning defence. Scope is taken only from the job's `ScopeRef` (derived by C3 at enqueue), never from request-body content; every `MemoryStore` write is scoped to that tenant namespace. All store writes go through the `MemoryStore` trait whose SurrealDB implementation uses **parameterised** queries (bound `$values`), never string-concatenated content into SQL. PII handling per SA-PII-01: high-confidence spans redacted in place, lower-confidence flagged `pii_review`. No content, PII span text, secrets, or tokens are ever logged — only counts and ids. No hardcoded URLs/keys; the embed/LLM endpoints and keys come from env (`RECALL_EMBED_URL`, `RECALL_EMBED_API_KEY`, `RECALL_LLM_URL`, `RECALL_LLM_API_KEY`).
-- **Observability.** Structured logs (each carrying `correlation_id`, `job_id`, `tenant`): `write.job.claimed`, `write.filtered_noise`, `write.extracted` (`fact_count`), `write.entities.resolved` (`entity_count`, `created_count`), `write.pii.scanned` (`redacted_count`, `flagged_count`), `write.gate` (`decision`, `trust`, `is_instruction_like`), `write.persisted` (`fact_id`, `memory_class`, `confidence`, `salience`, `pii_review`), `write.job.failed` (`code`, `retryable`, `attempts`). Metrics (OpenTelemetry, labelled by `tenant` and `outcome`): counter `recall_write_jobs_total{outcome=persisted|quarantined|rejected|filtered_noise|failed}`; histogram `recall_write_job_duration_seconds`; histogram `recall_write_gate_trust_score`; counter `recall_write_pii_redactions_total`. Trace span `write.process` per job with child spans `write.extract`, `write.resolve_entities`, `write.pii_scan`, `write.gate`, `write.embed_and_persist`.
+- **Security.** **Untrusted-source content is data, never instructions** (ADR-008): the imperative-pattern detector caps instruction-like content strictly below the quarantine floor so it can never be admitted; extracted content is never evaluated, executed, or used to steer pipeline control flow. The write gate (SA-WGATE-01) is the memory-poisoning defence. Scope is taken only from the job's `ScopeRef` (derived by C3 at enqueue), never from request-body content; every `MemoryStore` write is scoped to that tenant namespace. All store writes go through the `MemoryStore` trait whose SurrealDB implementation uses **parameterised** queries (bound `$values`), never string-concatenated content into SQL. PII handling per SA-PII-01: high-confidence spans redacted in place, lower-confidence flagged `pii_review`. No content, PII span text, secrets, or tokens are ever logged — only counts and ids. PII detection is in-process and deterministic (ADR-015): no PII endpoint or key exists. No hardcoded URLs/keys; the embed endpoint and key come from env (`RECALL_EMBED_URL`, `RECALL_EMBED_API_KEY`).
+- **Observability.** Structured logs (each carrying `correlation_id`, `job_id`, `tenant`): `write.job.claimed`, `write.filtered_noise`, `write.intake` (`fact_count`), `write.entities.resolved` (`entity_count`, `created_count`), `write.pii.scanned` (`redacted_count`, `flagged_count`), `write.gate` (`decision`, `trust`, `is_instruction_like`), `write.persisted` (`fact_id`, `memory_class`, `confidence`, `salience`, `pii_review`), `write.job.failed` (`code`, `retryable`, `attempts`). Metrics (OpenTelemetry, labelled by `tenant` and `outcome`): counter `recall_write_jobs_total{outcome=persisted|quarantined|rejected|filtered_noise|failed}`; histogram `recall_write_job_duration_seconds`; histogram `recall_write_gate_trust_score`; counter `recall_write_pii_redactions_total`. Trace span `write.process` per job with child spans `write.intake`, `write.resolve_entities`, `write.pii_scan`, `write.gate`, `write.embed_and_persist`.
 
 #### Gaps
 
@@ -599,15 +587,6 @@ None. *(Resolved in the Phase 3 reconciliation pass. Detail of how each was clos
 - **`Source` upsert path — now canonical.** `MemoryStore::put_source` (upsert) and `get_source` are in
   the Phase 2C.6 surface and the C1 spec; `source_trust` is read from `Source.trust_signal`, defaulting
   to `RECALL_SOURCE_TRUST_DEFAULT` for a newly-seen source.
-- **LLM tier of entity resolution — pinned for v1 (assumption, `confidence: reduced`).** `LlmClient`
-  (2C.6) exposes only `extract`/`consolidate`, with no entity-adjudication method. v1 implements the
-  HLD's `rules → ML → LLM` ladder as **`rules → ML → create-new`**: when neither the deterministic
-  rules nor the ML similarity tier resolves an existing entity confidently, the pipeline **creates a
-  new entity rather than risk a wrong merge** (a later maintenance `merge_entities` pass can fold
-  duplicates). This narrows the HLD's stated capability and is therefore surfaced to the Phase 3.5
-  HLD-impact-pass as a candidate note for HLD `02-architecture.md` / `10-risks.md` (v1 defers LLM
-  entity adjudication); it is not a blocking gap because a complete, implementable behaviour is
-  specified.
 
 > Note: `RECALL_SOURCE_TRUST_DEFAULT` (f64, default 0.5, owner C4) is the prior-trust assigned to a
 > newly-seen source; it is recorded here and carried into the Phase 4 Configuration spec / Phase 2D.

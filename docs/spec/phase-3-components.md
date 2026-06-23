@@ -1,13 +1,14 @@
 # Phase 3 — Detailed Component Specifications (index)
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
+> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 Phase 3 exceeds the single-file threshold, so each component is one self-contained file under
 `docs/spec/components/`. Each follows the Phase 3 component template (Purpose, Approach, Shared
 Context, Public Interface + Example, Internal Logic, Data Model, Error Table, Acceptance Criteria,
-Performance/Security/Observability, Gaps) and carries its own `derivedFromHld:` pin (0.5.0 for the
-specs amended under RFC 01 / ADR-014 — C6, C8, and the retired C5; 0.4.x otherwise). Every spec is
+Performance/Security/Observability, Gaps) and carries its own `derivedFromHld:` pin (0.6.0 for the
+specs amended under RFC 02 / ADR-015 — C4, C7, and C8; 0.5.0 for C6 amended under RFC 01 / ADR-014;
+0.4.x otherwise). Every spec is
 self-contained — a code-generating LLM implements it from its own file plus the shared types it
 duplicates into its Shared Context.
 
@@ -36,9 +37,11 @@ and gave the shared provider types — `ProviderError`, `PiiSpan` — one canoni
 blocked from `codegen` on Gaps grounds; promotion to *Approved* is gated only by the Phase 6
 self-audit.
 
-External provider adapters (`EmbeddingClient`, `RerankClient`, `LlmClient`,
-`PiiDetector`) are thin HTTP/model adapters defined by their §2C.6 traits and carry no domain logic,
-so they have no standalone Phase 3 spec; the consuming component specs depend on the trait signatures.
+External provider adapters (`EmbeddingClient`, `RerankClient`) are thin HTTP adapters defined by their
+§2C.6 traits and carry no domain logic, so they have no standalone Phase 3 spec; the consuming
+component specs depend on the trait signatures. The `PiiDetector` trait remains a DI seam, but its
+default impl is **in-process and deterministic** (regex/pattern matching, no network call) per ADR-015.
+Recall holds no LLM: there is no `LlmClient` adapter and no `InsightCandidate` type.
 
 ## HLD-impact-pass
 
@@ -54,3 +57,16 @@ source-change check, the `Currency`/`FreshnessChecker`/`BrokerClient`/`SourceSta
 `RankedFact.source`) so the agent runs the freshness loop. The HLD edits (ADR-014 superseding ADR-013;
 glossary terms `stale-pending-refresh`/`unverified-currency` removed) landed in Review block 1; these
 Phase 3 edits introduced no new HLD findings.
+
+**RFC 02 / ADR-015 amendment (2026-06-22):** recall is **LLM-free**. C4 drops LLM-backed fact
+extraction — a `remember` payload now carries a structured, agent-asserted `content` object that the
+write pipeline wraps directly (the former agent-stated branch becomes the normal path), and entity
+resolution's terminal tier is create-new by design (not a deferral). C7 drops server-side
+consolidation, reducing the maintenance worker from five duties to four (supersession, decay/forget,
+re-embed, verifiable hard delete). The `LlmClient` trait, the `HttpLlmClient` adapter, the
+`InsightCandidate` type, the `Consolidate` `JobKind`, and the `RECALL_LLM_URL`/`RECALL_LLM_API_KEY`
+config (plus the consolidation-only `RECALL_MAINT_CONSOLIDATE_MIN_EPISODES` /
+`RECALL_INSIGHT_DECAY_FACTOR` keys) are removed; `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS` is renamed
+`RECALL_MAINT_MAX_INTERVAL_SECS`. PII detection is now an **in-process deterministic** detector
+(regex/pattern matching, no network call, no endpoint or key). The `consolidated` `MemoryClass` and
+`Fact.derived_from` are retained: the agent writes consolidated insights itself as agent-stated facts.

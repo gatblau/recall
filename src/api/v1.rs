@@ -501,13 +501,16 @@ pub async fn remember(
     pipe.finish_success(&state, StatusCode::ACCEPTED, body, vec![]).await
 }
 
-/// Build the work-job payload for a remember request: the request serialised as JSON (content +
-/// optional source + agent_stated flag), validated by the C4 consumer.
+/// Build the work-job payload for a remember request: the request serialised as JSON (structured
+/// content + optional source + optional memory_class), validated by the C4 consumer. Content is
+/// agent-asserted; recall performs no LLM extraction (ADR-015).
 fn remember_payload(req: &RememberRequest) -> Value {
     let mut payload = serde_json::json!({
         "content": req.content,
-        "agent_stated": req.agent_stated,
     });
+    if let Some(mc) = &req.memory_class {
+        payload["memory_class"] = serde_json::to_value(mc).unwrap_or(Value::Null);
+    }
     if let Some(src) = &req.source {
         let mut s = serde_json::json!({ "origin_ref": src.origin_ref });
         if let Some(m) = &src.modification_marker {

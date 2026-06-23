@@ -115,9 +115,6 @@ pub struct Config {
     // --- C6 rerank ---
     pub rerank_url: String,
     pub rerank_api_key: Secret,
-    // --- C4/C7 llm ---
-    pub llm_url: String,
-    pub llm_api_key: Secret,
     // --- C2 queue ---
     pub queue_backend: QueueBackend,
     pub queue_nats_url: Option<String>,
@@ -142,10 +139,8 @@ pub struct Config {
     pub decay_k: f64,
     pub prune_retrievability: f64,
     pub idle_quiet_secs: u32,
-    pub consolidate_max_interval_secs: u32,
+    pub maint_max_interval_secs: u32,
     pub maint_batch_size: u32,
-    pub maint_consolidate_min_episodes: u32,
-    pub insight_decay_factor: f64,
     pub reinforce_gain: f64,
     // --- C8 edge ---
     pub idempotency_ttl_secs: u32,
@@ -240,8 +235,6 @@ impl Config {
         let embed_api_key = Secret::new(src.required("RECALL_EMBED_API_KEY")?);
         let rerank_url = src.required("RECALL_RERANK_URL")?;
         let rerank_api_key = Secret::new(src.required("RECALL_RERANK_API_KEY")?);
-        let llm_url = src.required("RECALL_LLM_URL")?;
-        let llm_api_key = Secret::new(src.required("RECALL_LLM_API_KEY")?);
 
         // --- C8 HTTP ---
         let http_addr_raw = src.get_or("RECALL_HTTP_ADDR", "0.0.0.0:8080");
@@ -350,23 +343,12 @@ impl Config {
         )?;
         let idle_quiet_secs =
             parse_field("RECALL_IDLE_QUIET_SECS", &src.get_or("RECALL_IDLE_QUIET_SECS", "300"))?;
-        let consolidate_max_interval_secs = parse_field(
-            "RECALL_CONSOLIDATE_MAX_INTERVAL_SECS",
-            &src.get_or("RECALL_CONSOLIDATE_MAX_INTERVAL_SECS", "21600"),
+        let maint_max_interval_secs = parse_field(
+            "RECALL_MAINT_MAX_INTERVAL_SECS",
+            &src.get_or("RECALL_MAINT_MAX_INTERVAL_SECS", "21600"),
         )?;
         let maint_batch_size =
             parse_field("RECALL_MAINT_BATCH_SIZE", &src.get_or("RECALL_MAINT_BATCH_SIZE", "500"))?;
-        let maint_consolidate_min_episodes = parse_field(
-            "RECALL_MAINT_CONSOLIDATE_MIN_EPISODES",
-            &src.get_or("RECALL_MAINT_CONSOLIDATE_MIN_EPISODES", "3"),
-        )?;
-        let insight_decay_factor = in_unit_range(
-            "RECALL_INSIGHT_DECAY_FACTOR",
-            parse_field(
-                "RECALL_INSIGHT_DECAY_FACTOR",
-                &src.get_or("RECALL_INSIGHT_DECAY_FACTOR", "0.9"),
-            )?,
-        )?;
         let reinforce_gain: f64 =
             parse_field("RECALL_REINFORCE_GAIN", &src.get_or("RECALL_REINFORCE_GAIN", "0.5"))?;
 
@@ -420,8 +402,6 @@ impl Config {
             embed_dim,
             rerank_url,
             rerank_api_key,
-            llm_url,
-            llm_api_key,
             queue_backend,
             queue_nats_url,
             job_max_attempts,
@@ -442,10 +422,8 @@ impl Config {
             decay_k,
             prune_retrievability,
             idle_quiet_secs,
-            consolidate_max_interval_secs,
+            maint_max_interval_secs,
             maint_batch_size,
-            maint_consolidate_min_episodes,
-            insight_decay_factor,
             reinforce_gain,
             idempotency_ttl_secs,
             rate_read_per_min,
@@ -489,8 +467,6 @@ mod tests {
             ("RECALL_EMBED_API_KEY", "secret-embed"),
             ("RECALL_RERANK_URL", "https://rerank.example"),
             ("RECALL_RERANK_API_KEY", "secret-rerank"),
-            ("RECALL_LLM_URL", "https://llm.example"),
-            ("RECALL_LLM_API_KEY", "secret-llm"),
         ] {
             m.insert(k.to_string(), v.to_string());
         }

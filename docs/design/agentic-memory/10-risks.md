@@ -1,6 +1,6 @@
 # 10 — Risks, Alternatives, Dependencies, Rollout
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 ## Risks
 

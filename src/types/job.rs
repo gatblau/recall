@@ -31,7 +31,6 @@ pub struct WorkJob {
 pub enum JobKind {
     ExtractFact,
     ReEmbedFact,
-    Consolidate,
     HardDelete,
 }
 

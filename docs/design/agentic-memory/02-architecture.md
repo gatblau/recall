@@ -1,6 +1,6 @@
 # 02 — System Architecture
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 `recall` is internally split along one principal seam: a **fast synchronous read path** and a **slow
 asynchronous write/maintenance path**, sharing one hybrid store. This seam is the central
@@ -34,8 +34,7 @@ flowchart TB
     maint <--> store
     retr <--> store
     retr -. query embed + cross-encoder rerank read path .-> ext1
-    wpipe -. fact embed + extraction .-> ext1[Embedding + reranker + LLM providers]
-    maint -. consolidation .-> ext1
+    wpipe -. fact embed .-> ext1[Embedding + reranker providers]
 ```
 
 ### Component responsibilities
@@ -64,17 +63,16 @@ flowchart TB
 - **Durable work queue** — decouples ingestion and maintenance from the request, so a slow or failed
   write never blocks a read and writes are retry-safe. Owns: async hand-off. Depends on: nothing
   internal.
-- **Write Pipeline** (asynchronous) — filters noise, extracts structured facts (single-pass,
-  including agent-stated facts), normalises, resolves entity identity (rules→ML→create-new in v1; LLM
-  adjudication deferred — see [10 — Risks](./10-risks.md)), scores
-  importance and confidence, and applies the write gate (trust scoring; quarantine/reject untrusted
-  content) before persisting. Owns: clean ingestion. Depends on: Memory Store, Embedding + LLM
-  providers.
-- **Maintenance Worker** (asynchronous, idle-biased) — runs consolidation (episodic→semantic with
-  validation-before-promotion and uncertainty decay), detects and supersedes contradictions, applies
+- **Write Pipeline** (asynchronous) — accepts **agent-asserted structured facts** (no LLM extraction —
+  ADR-015), filters noise, normalises, resolves entity identity (rules→ML→create-new in v1; LLM
+  adjudication deferred — see [10 — Risks](./10-risks.md)), scores importance and confidence, and
+  applies the write gate (trust scoring; quarantine/reject untrusted content) before persisting. Owns:
+  clean ingestion. Depends on: Memory Store, Embedding provider.
+- **Maintenance Worker** (asynchronous, idle-biased) — detects and supersedes contradictions, applies
   graceful decay with the salience floor, performs verifiable deletion, and re-embeds facts whose
-  content changed or whose embedding-model version is stale.
-  Owns: keeping memory true and bounded over time. Depends on: Memory Store, LLM provider.
+  content changed or whose embedding-model version is stale. **Consolidation is agent-side (ADR-015)** —
+  the worker performs no episodic→semantic consolidation and makes no LLM call.
+  Owns: keeping memory true and bounded over time. Depends on: Memory Store, Embedding provider.
 - **Memory Store** — one hybrid multi-model store holding the bi-temporal knowledge graph with vector
   and keyword indexes; rich edges carry validity interval, ingestion time, confidence, salience, and
   source. Runs **in-process (embedded SurrealDB)** by default; the same engine abstraction can target

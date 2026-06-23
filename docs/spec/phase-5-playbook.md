@@ -1,7 +1,7 @@
 # Phase 5 — Generation Playbook
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
+> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 The ordered build checklist `codegen` follows, one Playbook step per invocation. Steps respect the
 Phase 2B dependency DAG: every component depends only on lower-numbered steps. The cross-cutting
@@ -31,7 +31,7 @@ bi-temporal edges, **and** exercise the remote SurrealDB/TiKV path through the s
 - [ ] **X6 Configuration** — typed `Config` from env > file > default with startup validation (§2D, 40+ keys); fail-fast on missing required keys and the embedding-dimension check (SA-EMBED-01).
 - [ ] **X3/X4/X5 Observability** — `tracing` JSON logging with correlation-id + redaction, the metric catalogue, OTLP tracing with async context propagation.
 - [ ] Shared types (§2C.1–§2C.6): envelopes, domain entities (incl. `Fact.pii_review`), scope + read-filter, API payloads (incl. `RecallRequest.include_provenance`, `RankedFact.source: Option<SourceProvenance>`), work-queue types, the `MemoryStore`/`WorkQueue` and provider traits, `ProviderError`/`PiiSpan`.
-- [ ] Provider adapters (`src/providers/`): thin HTTP impls of `EmbeddingClient`, `RerankClient`, `LlmClient`, `PiiDetector` with timeouts + bounded retry; test stand-ins. (No `BrokerClient` — ADR-014.)
+- [ ] Provider adapters (`src/providers/`): thin HTTP impls of `EmbeddingClient`, `RerankClient` with timeouts + bounded retry; test stand-ins. (No `BrokerClient` — ADR-014; no `LlmClient` — ADR-015.) The `PiiDetector` default impl is **in-process deterministic** (regex/pattern, no network call — ADR-015).
 - [ ] CI wiring per the Practice Pack: build, test, lint, coverage gate (≥70%), `secscan`.
 
 ## Step 2 — C1 Memory Store (Phase 1)
@@ -47,13 +47,13 @@ bi-temporal edges, **and** exercise the remote SurrealDB/TiKV path through the s
 
 ## Step 4 — C4 Write Pipeline (Phase 3)
 
-- [ ] **C4** (`components/write-pipeline.md`): the 8-step pipeline (filter→extract→normalise→entity-resolve(rules→ML→create-new)→score→PII scan→write gate→embed+persist), `quarantine` table, idempotent persist. Tests for admit/quarantine/reject, PII redaction/flag, replay idempotency.
+- [ ] **C4** (`components/write-pipeline.md`): the 8-step pipeline (filter→intake(structured, no LLM)→normalise→entity-resolve(rules→ML→create-new)→score→PII scan(in-process)→write gate→embed+persist), `quarantine` table, idempotent persist. Tests for admit/quarantine/reject, PII redaction/flag, replay idempotency, non-object-content rejection.
 - [ ] **C5 Freshness Checker — RETIRED (ADR-014):** not built. Freshness is agent-side; `recall` performs no source-change check and makes no outbound broker call.
 
 ## Step 5 — C6 Retrieval Engine · C7 Maintenance Worker (Phase 4)
 
 - [ ] **C6** (`components/retrieval-engine.md`): the read pipeline (embed→stage-1 multi-signal→rerank→recency→gate/abstain→cursor→provenance-attach (conditional, ADR-014)), SA-LAT-01 sub-budgets + degradation. Tests for happy/abstain/rerank-timeout-degrade/store-timeout/provenance-on-off + the p95 budget assertion.
-- [ ] **C7** (`components/maintenance-worker.md`): scheduler (idle via activity probe + fallback timer) + queue-consumer; consolidation (validate-before-promote, decaying confidence), supersession, decay (Ebbinghaus + salience floor), re-embed, verifiable hard delete; `maintenance_state`. Unit-test the decay/consolidation pure cores against case tables.
+- [ ] **C7** (`components/maintenance-worker.md`): scheduler (idle via activity probe + fallback timer) + queue-consumer (claims `ReEmbedFact`/`HardDelete`); four duties — supersession, decay (Ebbinghaus + salience floor), re-embed, verifiable hard delete; `maintenance_state`. No consolidation (agent-side, ADR-015). Unit-test the decay pure core against case tables.
 
 ## Step 6 — C8 HTTP API Edge (Phase 5)
 

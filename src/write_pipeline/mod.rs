@@ -8,7 +8,7 @@
 //! through eight ordered step functions in fixed order:
 //!
 //!   1. Filter noise         — drop empty / low-signal content (data minimisation).
-//!   2. Extract              — `LlmClient::extract`, or bypass the LLM for agent-stated content.
+//!   2. Intake               — wrap the structured, agent-asserted content as a Fact (no LLM; ADR-015).
 //!   3. Normalise            — canonicalise content (key order, whitespace, NFC, RFC3339 ms).
 //!   4. Entity-resolve       — rules -> ML -> create-new ladder (v1; never silent overwrite).
 //!   5. Score                — salience + confidence in [0,1] (SA-SCORE-01).
@@ -45,7 +45,7 @@ use crate::types::api::SourceInput;
 use crate::types::domain::{Entity, Fact, MemoryClass, Source, Visibility};
 use crate::types::job::{JobKind, WorkJob};
 use crate::types::ports::{
-    EmbeddingClient, EntityMention, ExtractedFact, LlmClient, MemoryStore, PiiDetector, PiiSpan,
+    EmbeddingClient, EntityMention, ExtractedFact, MemoryStore, PiiDetector, PiiSpan,
     ProviderError, StoreError, WorkQueue,
 };
 use crate::types::scope::{OpSet, ScopeContext, ScopeRef};
@@ -149,14 +149,16 @@ impl WritePipelineConfig {
 /// this resolves to the existing entity; otherwise the mention escalates to create-new.
 const ML_SIMILARITY_ADMIT: f64 = 0.92;
 
-/// The validated `remember` job payload deserialised from `WorkJob::payload` (step 0).
+/// The validated `remember` job payload deserialised from `WorkJob::payload` (step 0). Content is a
+/// structured, agent-asserted assertion object (no LLM extraction; ADR-015).
 #[derive(Deserialize)]
 struct JobPayload {
     content: Json,
     #[serde(default)]
     source: Option<SourceInput>,
+    /// Optional caller-asserted class; defaults to `Episodic` (SA-WRITE-STRUCTURED-01).
     #[serde(default)]
-    agent_stated: bool,
+    memory_class: Option<MemoryClass>,
 }
 
 /// The runtime entrypoint and step functions of the Write Pipeline (C4 *Public Interface*).
@@ -164,7 +166,6 @@ pub struct WritePipeline {
     store: Arc<dyn MemoryStore>,
     queue: Arc<dyn WorkQueue>,
     embed: Arc<dyn EmbeddingClient>,
-    llm: Arc<dyn LlmClient>,
     pii: Arc<dyn PiiDetector>,
     /// Shared SurrealDB handle for the C4-owned `quarantine` table (mirrors how C2 writes its tables
     /// over `Store::handle()`); `None` when no quarantine sink is wired (the gate then rejects rather
@@ -175,12 +176,11 @@ pub struct WritePipeline {
 
 impl WritePipeline {
     /// Construct with injected dependencies and validated config. `db` is the shared store connection
-    /// used for the C4-owned `quarantine` table writes.
+    /// used for the C4-owned `quarantine` table writes. No LLM: content arrives structured (ADR-015).
     pub fn new(
         store: Arc<dyn MemoryStore>,
         queue: Arc<dyn WorkQueue>,
         embed: Arc<dyn EmbeddingClient>,
-        llm: Arc<dyn LlmClient>,
         pii: Arc<dyn PiiDetector>,
         db: Surreal<Any>,
         cfg: WritePipelineConfig,
@@ -189,7 +189,6 @@ impl WritePipeline {
             store,
             queue,
             embed,
-            llm,
             pii,
             db: Some(db),
             cfg,
@@ -331,9 +330,9 @@ impl WritePipeline {
             return Ok(WriteOutcome::FilteredNoise);
         }
 
-        // Step 2 — extract.
-        let facts = self.extract(&payload.content, payload.agent_stated).await?;
-        tracing::info!(target: "recall", job_id = %job.id, fact_count = facts.len(), "write.extracted");
+        // Step 2 — intake: wrap the structured, agent-asserted content as a Fact (no LLM; ADR-015).
+        let facts = self.intake(&payload.content, payload.memory_class);
+        tracing::info!(target: "recall", job_id = %job.id, fact_count = facts.len(), "write.intake");
         if facts.is_empty() {
             self.complete(&job.id).await?;
             return Ok(WriteOutcome::FilteredNoise);
@@ -470,26 +469,18 @@ impl WritePipeline {
         non_ws_string_len(content) < 3
     }
 
-    /// Step 2. Extract structured facts. If `agent_stated`, bypass the LLM and wrap the content
-    /// directly as a single asserted `ExtractedFact` (`extractor_confidence = 1.0`, `memory_class =
-    /// Episodic`); the extracted content is treated as data, never instructions. Otherwise call
-    /// `LlmClient::extract`.
-    pub async fn extract(
-        &self,
-        content: &Json,
-        agent_stated: bool,
-    ) -> Result<Vec<ExtractedFact>, AppError> {
-        if agent_stated {
-            let entities = scan_entity_mentions(content);
-            return Ok(vec![ExtractedFact {
-                content: content.clone(),
-                entities,
-                memory_class: MemoryClass::Episodic,
-                confidence: 1.0,
-            }]);
-        }
-        let facts = self.llm.extract(content).await?;
-        Ok(facts)
+    /// Step 2. Intake the structured, agent-asserted `content` as a single `ExtractedFact`
+    /// (`confidence = 1.0`, `memory_class` from the request or `Episodic`); recall performs no LLM
+    /// extraction (ADR-015). The content is treated as data, never instructions. Returns a one-element
+    /// vector (the downstream steps run per `ExtractedFact`, so the shape is preserved).
+    pub fn intake(&self, content: &Json, memory_class: Option<MemoryClass>) -> Vec<ExtractedFact> {
+        let entities = scan_entity_mentions(content);
+        vec![ExtractedFact {
+            content: content.clone(),
+            entities,
+            memory_class: memory_class.unwrap_or(MemoryClass::Episodic),
+            confidence: 1.0,
+        }]
     }
 
     /// Step 3. Canonicalise content: sort object keys, collapse internal whitespace runs to single

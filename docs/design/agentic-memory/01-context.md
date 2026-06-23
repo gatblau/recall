@@ -1,6 +1,6 @@
 # 01 — System Context
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 `recall` is a network service called by the Faraday broker on behalf of an end user, backed by a
 memory store and assisted by external model providers for the asynchronous write/maintenance path.
@@ -17,7 +17,6 @@ flowchart TB
     recall -->|in-process embedded<br/>TLS if remote| store[(Memory store<br/>graph + vector + keyword)]
     recall -->|query embed read path +<br/>fact-content embed async, HTTPS| embed[Embedding model provider]
     recall -->|rerank top-k read path, HTTPS| rerank[Reranker<br/>cross-encoder]
-    recall -->|async, off read path, HTTPS| llm[LLM provider<br/>extraction + consolidation]
     broker -->|reads source docs + checks freshness as the user| sources[(Source systems / documents)]
 
     recall -->|logs, metrics, traces| obs[Observability stack]
@@ -28,7 +27,10 @@ flowchart TB
 - **End user** — the human whose question ultimately drives a memory operation. **Interaction:**
   indirect; never talks to `recall` directly. Identity flows through the broker.
 - **AI agent (Faraday sandbox)** — writes the short script that uses memory; runs sealed, holds no
-  credentials. **Interaction:** indirect, via the broker. Treats `recall` responses as untrusted data.
+  credentials. **Performs the reasoning `recall` does not:** it extracts structured facts from content
+  and distils episodes into insights with its own LLM, then writes them to `recall` as structured,
+  agent-asserted assertions (ADR-015). **Interaction:** indirect, via the broker. Treats `recall`
+  responses as untrusted data.
 - **Faraday broker** — the trusted caller, co-located with the agent. Authenticates as the end user,
   injects an OIDC bearer token, enforces the system allowlist and Faraday-side audit, and reads source
   documents / checks their freshness on the agent's behalf. **Interaction:** HTTPS to `recall`'s API;
@@ -52,9 +54,6 @@ flowchart TB
   relevance. **Interaction:** `recall`→provider, HTTPS, on the **synchronous read path** over a bounded
   candidate set. A discriminative model inference, **not an LLM call**, so it respects NFR-P1 while
   still consuming read-path latency (ADR-005, ADR-012).
-- **LLM provider** — performs fact extraction and consolidation reasoning. **Interaction:**
-  `recall`→provider, HTTPS, **asynchronous only**; never invoked on the synchronous read path. This is
-  the call NFR-P1 ("no LLM calls on the read path") forbids on the read path.
 - **Source systems / documents** — the documents memory is learned from and whose freshness is
   checked. **Interaction:** read and freshness-checked **by the broker/agent as the user**, never by
   `recall` directly, so source access rights are enforced by the source systems (no central

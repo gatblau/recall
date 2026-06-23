@@ -1,6 +1,6 @@
 # 05 — Tech Stack
 
-> **Mode:** draft · **Revision:** 0.5.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
 Committed defaults below are the starting position; the materially contested ones are recorded as ADRs
 (see [09 — Decisions](./09-decisions.md)) and open questions (see [10 — Risks](./10-risks.md) and the
@@ -19,7 +19,7 @@ specific product — those are flagged.
 | Build / test toolchain | Cargo + the active Practice Pack; BDD (e.g. `cucumber`) + testcontainers, Dex for OIDC tests *(ADR-010)* | Outside-in integration/BDD suite through the public API with containerised dependencies; in-memory SurrealDB for the fast inner loop; reused container sessions for speed; Practice Pack supplies exact commands. |
 | Embedding model | External provider; **fact-content embedding async at write time, query embedding on the read path** *(OQ-MODELS, ADR-012)* | Fact vectors are computed off the read path and cached; the per-query embedding is a read-path model inference inside the latency budget. A local/in-process embedder is the latency mitigation if a remote hop threatens NFR-P2/P3. |
 | Reranker | Cross-encoder, **on the read path** over the bounded stage-1 candidate set *(OQ-MODELS, ADR-012)* | Stage 2 of two-stage retrieval (`good-mem.md` §7.2); a discriminative model inference (not an LLM, so NFR-P1 holds) that still consumes read-path latency. Local vs hosted is therefore a latency decision, not async cost tuning. |
-| Extraction / consolidation LLM | External provider, async only *(OQ-MODELS)* | Single-pass extraction and consolidation; never on the synchronous read path. |
+| ~~Extraction / consolidation LLM~~ | **None — recall is LLM-free (ADR-015)** | Extraction is performed by the agent; server-side consolidation is dropped. `recall` holds no LLM provider or key. |
 
 **Notes.**
 

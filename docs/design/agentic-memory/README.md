@@ -2,7 +2,7 @@
 
 > **Mode:** draft
 > **Generated from:** inline context — `docs/concept/agentic-mem.md`, `docs/concept/good-mem.md`, `docs/concept/requirements.md`
-> **Revision:** 0.5.0
+> **Revision:** 0.6.0
 > **Last updated:** 2026-06-22
 
 ## Orientation

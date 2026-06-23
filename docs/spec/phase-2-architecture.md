@@ -1,7 +1,7 @@
 # Phase 2 — Architecture Artefacts
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
+> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 ## Table of contents
 
@@ -28,7 +28,6 @@ flowchart TB
     idp[(OIDC Identity Provider)]
     embed["Embedding provider"]
     rerank["Reranker (cross-encoder)"]
-    llm["LLM provider"]
     obs["Observability stack"]
 
     subgraph recall["recall (single Rust binary)"]
@@ -53,10 +52,8 @@ flowchart TB
     queue -->|in-proc, claim job| wpipe
     queue -->|in-proc, claim job| maint
     wpipe -->|in-proc, persist| store
-    wpipe -->|HTTPS + provider API key, fact embed + extract| embed
-    wpipe -->|HTTPS + provider API key, extract| llm
+    wpipe -->|HTTPS + provider API key, fact embed| embed
     maint -->|in-proc| store
-    maint -->|HTTPS + provider API key, consolidate + re-embed| llm
     maint -->|HTTPS + provider API key, re-embed| embed
     recall -->|OTLP/gRPC + bearer, logs/metrics/traces| obs
 ```
@@ -101,7 +98,7 @@ No cycles: every edge points from a lower phase to a higher one. C6 Retrieval de
 indirectly, by enqueuing on C2 — the write path is asynchronous (ADR-004), so there is no synchronous
 C8→C4 edge.
 
-**External provider adapters** (`EmbeddingClient`, `RerankClient`, `LlmClient`,
+**External provider adapters** (`EmbeddingClient`, `RerankClient`,
 `PiiDetector`) are not separate components — they are trait abstractions defined in 2C and injected
 into the components that use them. They live under `src/providers/` as thin HTTP adapters and carry no
 domain logic, so they need no standalone Phase 3 spec; their contracts are the traits in 2C.
@@ -314,10 +311,10 @@ pub struct SourceProvenance {
 
 #[derive(Deserialize)]
 pub struct RememberRequest {
-    pub content: serde_json::Value,          // raw content to extract a fact from
+    pub content: serde_json::Value,          // structured assertion object (the agent extracts; ADR-015)
     pub source: Option<SourceInput>,
     #[serde(default)]
-    pub agent_stated: bool,                  // true => caller asserts this directly
+    pub memory_class: Option<MemoryClass>,   // optional; default Episodic (SA-WRITE-STRUCTURED-01)
 }
 
 #[derive(Deserialize)]
@@ -369,7 +366,7 @@ pub struct WorkJob {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum JobKind { ExtractFact, ReEmbedFact, Consolidate, HardDelete }  // ReReadSource removed by ADR-014
+pub enum JobKind { ExtractFact, ReEmbedFact, HardDelete }  // ReReadSource removed (ADR-014); Consolidate removed (ADR-015)
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -377,7 +374,7 @@ pub enum JobStatus { Pending, Leased, Done, DeadLetter }
 ```
 
 **Used by:** C2 (owns the table + claim/lease), C4 (consumes `ExtractFact`), C7 (consumes
-`ReEmbedFact`/`Consolidate`/`HardDelete`), C8 (produces `ExtractFact`, `HardDelete`).
+`ReEmbedFact`/`HardDelete`), C8 (produces `ExtractFact`, `HardDelete`).
 
 ### 2C.6 — Provider & infrastructure traits (dependency-injected)
 
@@ -449,11 +446,9 @@ pub trait RerankClient: Send + Sync {                 // impl: HTTP adapter
     async fn rerank(&self, query: &str, docs: &[String]) -> Result<Vec<f64>, ProviderError>;
 }
 
-#[async_trait]
-pub trait LlmClient: Send + Sync {                    // impl: HTTP adapter (async path only)
-    async fn extract(&self, content: &serde_json::Value) -> Result<Vec<ExtractedFact>, ProviderError>;
-    async fn consolidate(&self, episodes: &[Fact]) -> Result<Vec<InsightCandidate>, ProviderError>;
-}
+// (LlmClient removed by ADR-015 — recall is LLM-free: the agent extracts and consolidates; recall
+// accepts structured agent-asserted facts. `ExtractedFact`/`EntityMention` remain as the C4-internal
+// wrapper for structured content. `InsightCandidate` is removed with server-side consolidation.)
 
 // (BrokerClient removed by ADR-014 — `recall` makes no outbound broker call.)
 
@@ -470,7 +465,7 @@ home), so all adapters share them:
 // src/types/ports.rs (continued)
 
 #[derive(thiserror::Error, Debug)]
-pub enum ProviderError {                  // shared by EmbeddingClient/RerankClient/LlmClient/PiiDetector
+pub enum ProviderError {                  // shared by EmbeddingClient/RerankClient/PiiDetector
     #[error("provider timeout")]          Timeout,            // -> 504 PROVIDER_TIMEOUT
     #[error("provider status {0}")]       Status(u16),        // -> 502 PROVIDER_ERROR
     #[error("provider transport: {0}")]   Transport(String),  // -> 502 PROVIDER_ERROR
@@ -487,8 +482,9 @@ pub struct PiiSpan {                       // PiiDetector::scan result (C4)
 **Used by:** the trait is the contract; each consuming component spec (C1/C2/C4/C6/C7) duplicates
 the exact signatures it depends on into its Shared Context. `StoreError` and the C1-owned
 `Candidate`/`StageOneQuery`/`AuditEntry` are defined in full in the **C1 Memory Store** spec;
-`QueueError` in **C2**; `ExtractedFact`/`EntityMention` in **C4**; `InsightCandidate` in **C7** — each
-referenced by name here. The full `MemoryStore` surface above is canonical; C1 implements it exactly.
+`QueueError` in **C2**; `ExtractedFact`/`EntityMention` in **C4** — each referenced by name here.
+(`InsightCandidate` removed with server-side consolidation, ADR-015.) The full `MemoryStore` surface
+above is canonical; C1 implements it exactly.
 
 ### 2C.7 — Typed application error
 
@@ -545,8 +541,6 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_EMBED_DIM` | u32 | `1024` | no | C1/C4/C6 | Embedding dimension; must equal the vector-index dimension (SA-EMBED-01). |
 | `RECALL_RERANK_URL` | url | _(none)_ | **yes** | C6 | Cross-encoder reranker endpoint. |
 | `RECALL_RERANK_API_KEY` | secret | _(none)_ | **yes** | C6 | Reranker key (env only). |
-| `RECALL_LLM_URL` | url | _(none)_ | **yes** | C4/C7 | Extraction/consolidation LLM endpoint (async path only). |
-| `RECALL_LLM_API_KEY` | secret | _(none)_ | **yes** | C4/C7 | LLM key (env only). |
 | `RECALL_QUEUE_BACKEND` | enum `store\|nats` | `store` | no | C2 | Work-queue backend (SA-QUEUE-01). |
 | `RECALL_QUEUE_NATS_URL` | url | _(unset)_ | conditional | C2 | Required iff `RECALL_QUEUE_BACKEND=nats`. |
 | `RECALL_JOB_MAX_ATTEMPTS` | u32 | `5` | no | C2 | Retry cap before dead-letter (SA-QUEUE-02). |
@@ -563,8 +557,8 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_SALIENCE_FLOOR` | f64 | `0.3` | no | C7 | Decay salience floor (SA-DECAY-01). |
 | `RECALL_DECAY_K` | f64 | `10.0` | no | C7 | Global decay constant `k`. |
 | `RECALL_PRUNE_RETRIEVABILITY` | f64 | `0.05` | no | C7 | Retrievability below which a low-salience fact is a prune candidate. |
-| `RECALL_IDLE_QUIET_SECS` | u32 | `300` | no | C7 | Idle period before a consolidation cycle (SA-CONSOL-01). |
-| `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS` | u32 | `21600` | no | C7 | Hard fallback consolidation interval (6 h). |
+| `RECALL_IDLE_QUIET_SECS` | u32 | `300` | no | C7 | Idle period before a maintenance cycle (SA-MAINT-CADENCE-01). |
+| `RECALL_MAINT_MAX_INTERVAL_SECS` | u32 | `21600` | no | C7 | Hard fallback maintenance interval (6 h, SA-MAINT-CADENCE-01). Renamed from `RECALL_CONSOLIDATE_MAX_INTERVAL_SECS` (ADR-015). |
 | `RECALL_IDEMPOTENCY_TTL_SECS` | u32 | `86400` | no | C8 | Idempotency-key retention window (SA-IDEM-01). |
 | `RECALL_RATE_READ_PER_MIN` | u32 | `120` | no | C8 | Read-class rate limit (SA-RATE-01). |
 | `RECALL_RATE_WRITE_PER_MIN` | u32 | `30` | no | C8 | Write-class rate limit. |
@@ -577,8 +571,6 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_REFORMULATION_ENABLED` | bool | `false` | no | C6 | A/B query-reformulation flag; off by default (good-mem §7.3, ADR-012). |
 | `RECALL_EMBED_MODEL_VERSION` | string | `default` | no | C4/C6/C7 | Active embedding-model version tag; the C7 re-embed scan keys on it (SA-EMBED-01). |
 | `RECALL_MAINT_BATCH_SIZE` | u32 | `500` | no | C7 | Per-duty maintenance scan bound; keeps a cycle off the read-path store budget. |
-| `RECALL_MAINT_CONSOLIDATE_MIN_EPISODES` | u32 | `3` | no | C7 | Minimum episode group size before consolidation is attempted (SA-CONSOL-01). |
-| `RECALL_INSIGHT_DECAY_FACTOR` | f64 | `0.9` | no | C7 | Per-cycle confidence decay factor applied to consolidated insights (SA-DECAY-01). |
 | `RECALL_REINFORCE_GAIN` | f64 | `0.5` | no | C7 | Stability gain `Δs` applied on recall/reinforcement (SA-DECAY-01). |
 
 **Conditional requirements** are validated at startup: `RECALL_QUEUE_NATS_URL` is required iff

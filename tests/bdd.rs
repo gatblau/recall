@@ -19,11 +19,11 @@ use recall::auth::{can_read, AuthConfig, AuthError, Authenticator, Op, ScopeRef 
 use recall::config::Config;
 use recall::error::{map_error, AppError, Env};
 use recall::maintenance::{
-    ConsolidationReport, CycleReport, DecayReport, HardDeletePayload, MaintenanceConfig,
+    CycleReport, DecayReport, HardDeletePayload, MaintenanceConfig,
     MaintenanceWorker, ReEmbedPayload, SupersessionReport,
 };
 use recall::providers::{
-    HttpEmbeddingClient, HttpLlmClient, HttpPiiDetector, HttpRerankClient,
+    HttpEmbeddingClient, HttpRerankClient, LocalPiiDetector,
 };
 use recall::queue::StoreWorkQueue;
 use recall::retrieval::{RecallOutcome, RetrievalConfig, RetrievalEngine};
@@ -32,7 +32,7 @@ use recall::types::api::RecallRequest;
 use recall::types::domain::{Fact, MemoryClass, Source, Visibility};
 use recall::types::job::{JobKind, JobStatus, WorkJob};
 use recall::types::ports::{
-    Candidate, EmbeddingClient, LlmClient, MemoryStore, PiiDetector,
+    Candidate, EmbeddingClient, MemoryStore, PiiDetector,
     QueueError, RecallFilters, RerankClient, StageOneQuery, StoreError, WorkQueue,
 };
 use recall::types::scope::{OpSet, ScopeContext, ScopeRef};
@@ -226,13 +226,11 @@ impl SystemHarness {
         let store: Arc<dyn MemoryStore> = self.store.clone();
         let queue: Arc<dyn WorkQueue> = self.queue.clone();
         let embed: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
-        let llm: Arc<dyn LlmClient> = Arc::new(HttpLlmClient::new(&config));
-        let pii: Arc<dyn PiiDetector> = Arc::new(HttpPiiDetector::new(&config));
+        let pii: Arc<dyn PiiDetector> = Arc::new(LocalPiiDetector::new());
         WritePipeline::new(
             store,
             queue,
             embed,
-            llm,
             pii,
             self.db.clone(),
             WritePipelineConfig::from_config(&config),
@@ -241,7 +239,7 @@ impl SystemHarness {
 }
 
 /// The C7 maintenance harness: a shared embedded SurrealDB engine backing the C1 store, the C2 queue,
-/// and a wiremock server playing the consolidation LLM and the embedding provider.
+/// and a wiremock server playing the embedding provider.
 struct MaintHarness {
     store: Arc<Store>,
     queue: Arc<StoreWorkQueue>,
@@ -266,8 +264,6 @@ struct WpHarness {
     handle: surrealdb::Surreal<surrealdb::engine::any::Any>,
     mocks: support::ProviderMocks,
     embed_dim: u32,
-    /// The contact string used by the PII scenarios (for the redaction span range).
-    contact: Option<String>,
 }
 
 impl std::fmt::Debug for RecallWorld {
@@ -358,7 +354,6 @@ fn parse_kind(k: &str) -> JobKind {
     match k {
         "extract_fact" => JobKind::ExtractFact,
         "re_embed_fact" => JobKind::ReEmbedFact,
-        "consolidate" => JobKind::Consolidate,
         "hard_delete" => JobKind::HardDelete,
         other => panic!("unknown job kind {other}"),
     }
@@ -1346,13 +1341,11 @@ impl WpHarness {
     fn pipeline(&self) -> WritePipeline {
         let config = wp_config(&self.mocks.base_url(), self.embed_dim);
         let embed: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
-        let llm: Arc<dyn LlmClient> = Arc::new(HttpLlmClient::new(&config));
-        let pii: Arc<dyn PiiDetector> = Arc::new(HttpPiiDetector::new(&config));
+        let pii: Arc<dyn PiiDetector> = Arc::new(LocalPiiDetector::new());
         WritePipeline::new(
             self.store.clone(),
             self.queue.clone(),
             embed,
-            llm,
             pii,
             self.handle.clone(),
             WritePipelineConfig::from_config(&config),
@@ -1428,8 +1421,6 @@ fn wp_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", "https://rerank.test"),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", base_url),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -1485,7 +1476,6 @@ async fn given_wp(world: &mut RecallWorld, dim: u32) {
         handle,
         mocks,
         embed_dim: dim,
-        contact: None,
     });
 }
 
@@ -1508,9 +1498,7 @@ async fn given_llm_contact_fact(world: &mut RecallWorld, contact: String, confid
         "subject": "Team Alpha", "predicate": "contact", "object": "orders table", "contact": contact
     });
     world.wp_extract_content = Some(content.clone());
-    if let Some(h) = world.wp.as_mut() {
-        h.contact = Some(contact);
-    }
+    let _ = contact;
     wp(world).mocks.mount_extract(content, confidence).await;
 }
 
@@ -1525,19 +1513,10 @@ async fn given_embed(world: &mut RecallWorld, dim: usize) {
     }
 }
 
+// PII is detected in-process and deterministically (ADR-015): the content itself decides what is
+// flagged/redacted, so this step is a no-op kept only so non-PII scenarios can assert "no spans".
 #[given("the PII detector returns no spans")]
-async fn given_pii_none(world: &mut RecallWorld) {
-    wp(world).mocks.mount_pii_none().await;
-}
-
-#[given(regex = r#"^the PII detector flags the contact email with confidence ([0-9.]+)$"#)]
-async fn given_pii_contact(world: &mut RecallWorld, confidence: f64) {
-    let contact = wp(world)
-        .contact
-        .clone()
-        .expect("a contact fact was set up before the PII stub");
-    wp(world).mocks.mount_pii_contact(&contact, confidence).await;
-}
+async fn given_pii_none(_world: &mut RecallWorld) {}
 
 #[given(
     regex = r#"^an enqueued extract_fact job "([^"]+)" for tenant "([^"]+)" user "([^"]+)" with key "([^"]+)" and a trusted source$"#
@@ -1819,8 +1798,6 @@ fn retr_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", base_url),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", "https://llm.test"),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -2096,14 +2073,13 @@ async fn then_retr_no_overlap(world: &mut RecallWorld) {
 
 impl MaintHarness {
     /// Assemble a `MaintenanceWorker` over this harness's store/queue and the wiremock-backed
-    /// consolidation LLM + embedding provider. Built per invocation so the latest mounts are in effect.
+    /// embedding provider. Built per invocation so the latest mounts are in effect.
     fn worker(&self) -> MaintenanceWorker {
         let config = maint_config(&self.mocks.base_url(), self.embed_dim);
         let store: Arc<dyn MemoryStore> = self.store.clone();
         let queue: Arc<dyn WorkQueue> = self.queue.clone();
-        let llm: Arc<dyn LlmClient> = Arc::new(HttpLlmClient::new(&config));
         let embed: Arc<dyn EmbeddingClient> = Arc::new(HttpEmbeddingClient::new(&config));
-        MaintenanceWorker::new(store, queue, llm, embed, MaintenanceConfig::from_config(&config))
+        MaintenanceWorker::new(store, queue, embed, MaintenanceConfig::from_config(&config))
     }
 
     /// Read the single fact row by id from the shared engine (mirrors WpHarness::first_fact). Returns
@@ -2129,43 +2105,6 @@ impl MaintHarness {
         rows.into_iter().next()
     }
 
-    /// Count consolidated facts persisted in a tenant (read directly from the shared engine).
-    async fn count_consolidated(&self, tenant: &str) -> u64 {
-        self.handle
-            .use_ns(tenant.to_string())
-            .use_db("recall")
-            .await
-            .expect("use ns/db");
-        let mut resp = self
-            .handle
-            .query("SELECT count() AS c FROM fact WHERE memory_class = 'consolidated' GROUP ALL")
-            .await
-            .expect("count consolidated");
-        let rows: Vec<Value> = resp.take(0).expect("take count");
-        rows.first()
-            .and_then(|r| r.get("c"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    }
-
-    /// The confidence of the single persisted consolidated fact in a tenant.
-    async fn consolidated_confidence(&self, tenant: &str) -> f64 {
-        self.handle
-            .use_ns(tenant.to_string())
-            .use_db("recall")
-            .await
-            .expect("use ns/db");
-        let mut resp = self
-            .handle
-            .query("SELECT confidence FROM fact WHERE memory_class = 'consolidated' LIMIT 1")
-            .await
-            .expect("select consolidated");
-        let rows: Vec<Value> = resp.take(0).expect("take row");
-        rows.first()
-            .and_then(|r| r.get("confidence"))
-            .and_then(|v| v.as_f64())
-            .expect("a consolidated confidence")
-    }
 }
 
 /// Build a `Config` whose LLM/embedding URLs point at the wiremock base URL and whose embed dim is the
@@ -2180,8 +2119,6 @@ fn maint_config(base_url: &str, embed_dim: u32) -> Config {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", "https://rerank.test"),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", base_url),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
     ] {
         m.insert(k.to_string(), v.to_string());
     }
@@ -2191,24 +2128,6 @@ fn maint_config(base_url: &str, embed_dim: u32) -> Config {
 
 fn maint(world: &RecallWorld) -> &MaintHarness {
     world.maint.as_ref().expect("maintenance harness built in a Given")
-}
-
-/// Seed an episodic fact for consolidation: a triple-shaped content carrying the shared subject.
-async fn seed_episode(
-    harness: &MaintHarness,
-    id: &str,
-    tenant: &str,
-    user: &str,
-    subject: &str,
-    confidence: f64,
-) {
-    let mut f = make_fact(id, tenant, "none", user, Visibility::UserPrivate);
-    f.memory_class = MemoryClass::Episodic;
-    f.content = serde_json::json!({
-        "subject": subject, "predicate": "did", "object": format!("event-{id}")
-    });
-    f.confidence = confidence;
-    harness.store.put_fact(&f).await.expect("seed episode");
 }
 
 #[given(regex = r#"^a maintenance worker over an embedded store with embedding dimension (\d+)$"#)]
@@ -2227,60 +2146,6 @@ async fn given_maint_worker(world: &mut RecallWorld, dim: u32) {
     world.maint_report = None;
     world.maint_proof = None;
     world.maint_err = None;
-}
-
-#[given(
-    regex = r#"^(\d+) episodic facts sharing subject "([^"]+)" with min confidence ([0-9.]+) for tenant "([^"]+)" user "([^"]+)"$"#
-)]
-async fn given_episodes(
-    world: &mut RecallWorld,
-    n: usize,
-    subject: String,
-    min_conf: f64,
-    tenant: String,
-    user: String,
-) {
-    let h = maint(world);
-    for i in 0..n {
-        // The first episode carries the minimum confidence; the rest are higher, so the source-cap is
-        // exercised against `min_conf`.
-        let conf = if i == 0 { min_conf } else { (min_conf + 0.2).min(1.0) };
-        seed_episode(h, &format!("fact:ep{i}"), &tenant, &user, &subject, conf).await;
-    }
-}
-
-#[given(
-    regex = r#"^the consolidation LLM returns one insight citing all (\d+) episodes with confidence ([0-9.]+)$"#
-)]
-async fn given_insight_all(world: &mut RecallWorld, n: usize, confidence: f64) {
-    let derived: Vec<String> = (0..n).map(|i| format!("fact:ep{i}")).collect();
-    let insights = serde_json::json!([{
-        "content": { "subject": "team:alpha", "predicate": "summary", "object": "standup at 9am" },
-        "entities": ["entity:e1"],
-        "derived_from": derived,
-        "confidence": confidence,
-        "support_count": n
-    }]);
-    maint(world).mocks.mount_consolidate(insights).await;
-}
-
-#[given(
-    regex = r#"^the consolidation LLM returns one insight citing an unknown fact with confidence ([0-9.]+)$"#
-)]
-async fn given_insight_unknown(world: &mut RecallWorld, confidence: f64) {
-    let insights = serde_json::json!([{
-        "content": { "subject": "team:alpha", "predicate": "summary", "object": "standup at 9am" },
-        "entities": ["entity:e1"],
-        "derived_from": ["fact:not-in-group"],
-        "confidence": confidence,
-        "support_count": 1
-    }]);
-    maint(world).mocks.mount_consolidate(insights).await;
-}
-
-#[given("the consolidation LLM returns no insights")]
-async fn given_no_insights(world: &mut RecallWorld) {
-    maint(world).mocks.mount_consolidate(serde_json::json!([])).await;
 }
 
 #[given(
@@ -2383,17 +2248,6 @@ fn maint_report(world: &RecallWorld) -> &CycleReport {
     world.maint_report.as_ref().expect("a cycle report")
 }
 
-#[then(regex = r#"^the ConsolidationReport reports promoted (\d+)$"#)]
-async fn then_promoted(world: &mut RecallWorld, n: u32) {
-    let r: &ConsolidationReport = &maint_report(world).consolidation;
-    assert_eq!(r.promoted, n, "promoted mismatch (report: groups_seen={}, candidates={}, rejected={})", r.groups_seen, r.candidates, r.rejected_validation);
-}
-
-#[then(regex = r#"^the ConsolidationReport reports rejected_validation (\d+)$"#)]
-async fn then_rejected(world: &mut RecallWorld, n: u32) {
-    assert_eq!(maint_report(world).consolidation.rejected_validation, n, "rejected_validation mismatch");
-}
-
 #[then(regex = r#"^the SupersessionReport reports superseded (\d+)$"#)]
 async fn then_superseded_count(world: &mut RecallWorld, n: u32) {
     let r: &SupersessionReport = &maint_report(world).supersession;
@@ -2404,18 +2258,6 @@ async fn then_superseded_count(world: &mut RecallWorld, n: u32) {
 async fn then_pruned_count(world: &mut RecallWorld, n: u32) {
     let r: &DecayReport = &maint_report(world).decay;
     assert_eq!(r.pruned, n, "pruned mismatch (evaluated={})", r.evaluated);
-}
-
-#[then(regex = r#"^exactly (\d+) consolidated facts? (?:is|are) persisted for tenant "([^"]+)"$"#)]
-async fn then_consolidated_count(world: &mut RecallWorld, n: u64, tenant: String) {
-    let c = maint(world).count_consolidated(&tenant).await;
-    assert_eq!(c, n, "consolidated fact count mismatch");
-}
-
-#[then(regex = r#"^the persisted consolidated fact confidence is at most ([0-9.]+)$"#)]
-async fn then_consolidated_conf(world: &mut RecallWorld, cap: f64) {
-    let conf = maint(world).consolidated_confidence("acme").await;
-    assert!(conf <= cap + 1e-9, "insight confidence {conf} exceeds source cap {cap}");
 }
 
 #[then(
@@ -2523,8 +2365,6 @@ async fn build_api_harness(world: &mut RecallWorld, index_dim: u32, config_dim: 
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", &mocks.base_url()),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", "https://llm.test"),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
     ] {
@@ -2884,7 +2724,6 @@ async fn build_system_harness(world: &mut RecallWorld) {
     let mocks = support::ProviderMocks::start().await;
     mocks.mount_embed(dim as usize).await;
     mocks.mount_rerank_uniform(0.9).await;
-    mocks.mount_pii_none().await;
     let mocks_base_url = mocks.base_url();
 
     // One shared in-memory engine: the store, its handle, and a store-backed queue over that handle.
@@ -2901,8 +2740,6 @@ async fn build_system_harness(world: &mut RecallWorld) {
         ("RECALL_EMBED_API_KEY", "test-embed-key"),
         ("RECALL_RERANK_URL", &mocks_base_url),
         ("RECALL_RERANK_API_KEY", "test-rerank-key"),
-        ("RECALL_LLM_URL", &mocks_base_url),
-        ("RECALL_LLM_API_KEY", "test-llm-key"),
         ("RECALL_HTTP_ADDR", "127.0.0.1:0"),
         ("RECALL_ENV", "development"),
     ] {

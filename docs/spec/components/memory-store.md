@@ -3,7 +3,7 @@
 **File:** `src/store` | **Package:** `recall::store` | **Phase:** 1 | **Dependencies:** none
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.5.0
+> **derivedFromHld:** 0.6.0
 
 #### Purpose
 

@@ -1,7 +1,7 @@
 # Phase 4 — Cross-Cutting Concern Specifications
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.5.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014)
+> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 Each concern below is a first-class component spec applying the Phase 3 template. These specs sit at
 **Phase 0** of the build order — foundational libraries/middleware consumed by the eight Phase 1–5
@@ -35,7 +35,7 @@ table draws its `code` values from it.
 
 **File:** `src/error.rs`, `src/api/envelope.rs` | **Package:** `recall::error` | **Phase:** 0 | **Dependencies:** §2C.1, §2C.7
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Defines the one success envelope, the one error envelope, the closed error-code registry, the
@@ -78,7 +78,7 @@ Every `code` is SCREAMING_SNAKE_CASE and appears here exactly once. No other val
 | `STORE_UNAVAILABLE` | 503 | Memory store connection lost / unreachable | C1, C8 |
 | `STORE_TIMEOUT` | 504 | Store op exceeded its per-statement budget | C1, C6 |
 | `QUEUE_UNAVAILABLE` | 503 | Work-queue backend unreachable | C2, C8 |
-| `PROVIDER_TIMEOUT` | 504 | Embedding/reranker/LLM call timed out | C4, C6, C7 |
+| `PROVIDER_TIMEOUT` | 504 | Embedding/reranker call timed out | C4, C6, C7 |
 | `PROVIDER_ERROR` | 502 | Provider returned an error status / malformed response | C4, C6, C7 |
 | `INTERNAL` | 500 | Unhandled internal invariant violation (incl. partial delete) | all |
 
@@ -147,7 +147,7 @@ None.
 
 **File:** `src/auth` (mechanism) + `src/api/middleware/auth.rs` | **Package:** `recall::auth` | **Phase:** 0 | **Dependencies:** C3, §2C.3
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 States the system-wide authn/authz policy that every authenticated endpoint enforces (ADR-001,
@@ -219,7 +219,7 @@ None.
 
 **File:** `src/obs/log.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Structured operational logging with correlation-id propagation and strict redaction — for debugging
@@ -287,7 +287,7 @@ None.
 
 **File:** `src/obs/metrics.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 The four quality layers from `good-mem.md` §13 (HLD 07 "Metrics"): task usage, memory quality,
@@ -351,7 +351,7 @@ None.
 
 **File:** `src/obs/trace.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Distributed tracing across the API edge, the read path, and the async workers so a request can be
@@ -359,16 +359,16 @@ followed end-to-end (HLD 07 "Tracing").
 
 #### Approach
 OpenTelemetry spans exported via OTLP to `RECALL_OTLP_ENDPOINT`; context propagated through the
-in-process call chain and onto enqueued jobs (the job carries the trace context so an async extraction
-or consolidation links back to the request that triggered it). Rejected alternative: no async
-propagation (rejected — breaks the link between a request and its async extraction/consolidation job).
+in-process call chain and onto enqueued jobs (the job carries the trace context so an async ingest or
+maintenance job links back to the request that triggered it). Rejected alternative: no async
+propagation (rejected — breaks the link between a request and its async ingest/maintenance job).
 
 #### Shared Context
 Env: `RECALL_OTLP_ENDPOINT`, `RECALL_ENV`.
 
 #### Public Interface
 Span naming convention `<component>.<operation>` (e.g. `api.recall`, `store.recall.vector`,
-`write.extract`, `maintenance.consolidate_tenant`). Sampling: parent-based, default ratio 0.1 in
+`write.intake`, `maintenance.decay_tenant`). Sampling: parent-based, default ratio 0.1 in
 `production`, 1.0 in `development`. The trace/correlation id is the same `correlation_id` surfaced in
 responses and logs.
 
@@ -415,7 +415,7 @@ None.
 
 **File:** `src/config.rs` | **Package:** `recall::config` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Load, validate, and freeze all configuration at startup with precedence **env var > config file >
@@ -431,7 +431,7 @@ secrets risk leaking into logs).
 #### Shared Context
 The §2D variable table is the authoritative list. Required keys: `RECALL_OIDC_ISSUER`,
 `RECALL_OIDC_AUDIENCE`, `RECALL_EMBED_URL`, `RECALL_EMBED_API_KEY`, `RECALL_RERANK_URL`,
-`RECALL_RERANK_API_KEY`, `RECALL_LLM_URL`, `RECALL_LLM_API_KEY`. (`RECALL_BROKER_URL` removed by ADR-014.)
+`RECALL_RERANK_API_KEY`. (`RECALL_BROKER_URL` removed by ADR-014; `RECALL_LLM_URL`/`RECALL_LLM_API_KEY` removed by ADR-015.)
 
 #### Public Interface
 ```rust
@@ -494,7 +494,7 @@ None.
 
 **File:** `src/store/migrate.rs`, `migrations/*.surql` | **Package:** `recall::store` | **Phase:** 0 | **Dependencies:** C1, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Evolve the per-tenant SurrealDB schema through numbered, ordered, reversible migrations; dry-run before
@@ -582,7 +582,7 @@ None.
 
 **File:** `src/api/health.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C1, C3, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Liveness and readiness endpoints so an orchestrator can route traffic only to a healthy instance (HLD
@@ -653,7 +653,7 @@ None.
 
 **File:** `src/api/middleware/ratelimit.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C3, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Agent-aware rate limiting with standard headers (HLD 07 "Rate limiting"; SA-RATE-01) — agents emit far
@@ -721,7 +721,7 @@ None.
 
 **File:** `src/api/pagination.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C6, §2C.1, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Bounded, capped, token-efficient, stably-ordered result pages (HLD 07 "Pagination"; SA-PAGE-01,
@@ -789,7 +789,7 @@ None.
 
 **File:** `src/api/middleware/cors.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 HLD 07 records CORS as **Does not apply (default)** — callers are server-side (the broker), not
@@ -857,7 +857,7 @@ None.
 
 **File:** `src/api/validate.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** §2C, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 Validate at every API boundary, bound request size, and reject malformed input with the standard error
@@ -927,7 +927,7 @@ None.
 
 **File:** `src/shutdown.rs` | **Package:** `recall` | **Phase:** 0 | **Dependencies:** C2, C4, C6, C7, C8
 
-> **Mode:** greenfield · **derivedFromHld:** 0.5.0
+> **Mode:** greenfield · **derivedFromHld:** 0.6.0
 
 #### Purpose
 On SIGTERM/SIGINT, drain in-flight requests, finish or re-enqueue in-flight async jobs, and close the
