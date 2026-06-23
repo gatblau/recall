@@ -258,14 +258,13 @@ impl ProviderStub {
 //   * POST /embeddings  -> { "embeddings": [[f32; dim]] }
 //   * POST /rerank      -> { "scores": [f64, ..] }
 // The server's base URL is used as RECALL_EMBED_URL / RECALL_RERANK_URL so the HTTP adapters POST here.
-// recall is LLM-free (ADR-015) and PII detection is in-process; the residual `mount_extract` stub is no
-// longer hit by the pipeline (it wraps structured content directly) — it only seeds test content and is
-// slated for removal (plan FU-004).
+// recall is LLM-free (ADR-015) and PII detection is in-process: the write pipeline wraps structured
+// content directly via `intake`, so there is no `/extract` stub. Only embedding + rerank stubs remain.
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// A wiremock server stubbing the embedding, LLM-extract, and PII providers for the write pipeline.
+/// A wiremock server stubbing the embedding + reranker providers for the write and read pipelines.
 pub struct ProviderMocks {
     pub server: MockServer,
 }
@@ -295,42 +294,8 @@ impl ProviderMocks {
             .await;
     }
 
-    /// Mount an `/extract` stub returning one fact with the given content and confidence plus two
-    /// entity mentions (subject/object), `memory_class = semantic`.
-    pub async fn mount_extract(&self, content: serde_json::Value, confidence: f64) {
-        let body = serde_json::json!({
-            "facts": [{
-                "content": content,
-                "entity_mentions": [
-                    { "surface_form": "Team Alpha", "mention_type": "team" },
-                    { "surface_form": "orders table", "mention_type": "thing" }
-                ],
-                "memory_class": "semantic",
-                "extractor_confidence": confidence
-            }]
-        });
-        Mock::given(method("POST"))
-            .and(path("/extract"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
-    }
-
     // PII detection is in-process (ADR-015) — no `/pii/scan` stub is mounted; the content itself
     // deterministically decides what is flagged/redacted.
-
-    /// The number of recorded requests to `/extract` (proves the LLM was / was not called).
-    pub async fn extract_call_count(&self) -> usize {
-        self.server
-            .received_requests()
-            .await
-            .map(|reqs| {
-                reqs.iter()
-                    .filter(|r| r.url.path() == "/extract")
-                    .count()
-            })
-            .unwrap_or(0)
-    }
 
     // --- C6 Retrieval Engine provider stubs (Phase 7) ---------------------------------------
     //

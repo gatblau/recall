@@ -111,7 +111,7 @@ After Phase 3: `cargo build` + `cargo clippy --all-targets -- -D warnings` clean
   why: surfaced folding FU-003 — the C4 scenarios still say "the LLM extractor returns one fact …" and mount a `/extract` stub the pipeline no longer calls (it wraps the structured content directly). Harmless (tests green) but misleading in an LLM-free codebase.
   source: apply-phase-3
   suggested-command: edit tests/features/write_pipeline.feature + tests/bdd.rs (rename given to "a structured fact … is submitted"; drop mount_extract)
-  status: open
+  status: done
   added: 2026-06-23
 ```
 
@@ -143,6 +143,16 @@ After Phase 3: `cargo build` + `cargo clippy --all-targets -- -D warnings` clean
   likelihood: low
   impact: low
   mitigation: FU-001 sweep; recall boot is strictly more permissive after removal.
+  status: open
+  added: 2026-06-23
+- id: RISK-004
+  title: Intermittent BDD flake — one scenario aborted in ~1 of 5 full `cargo test` runs
+  why: observed during the FU-004 verification (4/5 runs 62/62; one run 61/62, 439 steps). Not introduced by FU-004 (which only renamed steps + removed dead stubs — no timing/concurrency change); pre-existing, likely a timing-sensitive harness scenario (ephemeral-port HTTP server poll, concurrent-claim, or decay/freshness timing). Could not reproduce on re-run to capture the scenario name.
+  source: apply-phase-3
+  likelihood: medium
+  impact: low
+  mitigation: investigate separately — re-run with `--test-threads=1` and cucumber per-scenario logging to capture the culprit; add a wait/retry or fixed clock if it is a poll race. Does not block the change (gate green on re-run).
+  suggested-command: /rca (capture the flaky scenario, then a targeted fix)
   status: open
   added: 2026-06-23
 ```

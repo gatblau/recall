@@ -9,7 +9,6 @@ Feature: Whole-system cross-component flows (Phase 10)
 
   Scenario: Async write becomes recallable only after the pending job is processed (eventual consistency)
     Given a system stack for tenant "acme"
-    And the extractor will return a fact matching "orders table" for the recall query
     And a system bearer token for user "u-77" tenant "acme" groups "platform" scope "memory.read memory.write"
     And a system Idempotency-Key "sys-w-001"
     When the client writes a memory with content {"text":"Team Alpha owns the orders table"}
@@ -25,7 +24,6 @@ Feature: Whole-system cross-component flows (Phase 10)
 
   Scenario: Cross-tenant isolation — a globex token never sees an acme fact (NFR-PR1)
     Given a system stack for tenant "acme"
-    And the extractor will return a fact matching "orders table" for the recall query
     And a system bearer token for user "u-77" tenant "acme" groups "platform" scope "memory.read memory.write"
     And a system Idempotency-Key "sys-iso-001"
     When the client writes a memory with content {"text":"Team Alpha owns the orders table"}
@@ -40,7 +38,6 @@ Feature: Whole-system cross-component flows (Phase 10)
 
   Scenario: Verifiable forget round-trip — remember, recall, DELETE with proof, then recall is empty
     Given a system stack for tenant "acme"
-    And the extractor will return a fact matching "orders table" for the recall query
     And a system bearer token for user "u-77" tenant "acme" groups "platform" scope "memory.read memory.write memory.forget"
     And a system Idempotency-Key "sys-f-001"
     When the client writes a memory with content {"text":"Team Alpha owns the orders table"}

@@ -1480,26 +1480,23 @@ async fn given_wp(world: &mut RecallWorld, dim: u32) {
 }
 
 #[given(
-    regex = r#"^the LLM extractor returns one fact "([^"]+)" with two entity mentions and confidence ([0-9.]+)$"#
+    regex = r#"^a structured fact "([^"]+)" with two entity mentions is submitted$"#
 )]
-async fn given_llm_fact(world: &mut RecallWorld, text: String, confidence: f64) {
+async fn given_llm_fact(world: &mut RecallWorld, text: String) {
     let content = serde_json::json!({
         "subject": "Team Alpha", "predicate": "owns", "object": "orders table", "text": text
     });
     world.wp_extract_content = Some(content.clone());
-    wp(world).mocks.mount_extract(content, confidence).await;
 }
 
 #[given(
-    regex = r#"^the LLM extractor returns one contact fact "([^"]+)" with two entity mentions and confidence ([0-9.]+)$"#
+    regex = r#"^a structured contact fact "([^"]+)" with two entity mentions is submitted$"#
 )]
-async fn given_llm_contact_fact(world: &mut RecallWorld, contact: String, confidence: f64) {
+async fn given_llm_contact_fact(world: &mut RecallWorld, contact: String) {
     let content = serde_json::json!({
         "subject": "Team Alpha", "predicate": "contact", "object": "orders table", "contact": contact
     });
     world.wp_extract_content = Some(content.clone());
-    let _ = contact;
-    wp(world).mocks.mount_extract(content, confidence).await;
 }
 
 #[given(regex = r#"^the embedding provider returns a vector of dimension (\d+)$"#)]
@@ -1569,7 +1566,7 @@ async fn given_job_lowtrust(
 }
 
 #[given(
-    regex = r#"^an enqueued agent-stated extract_fact job "([^"]+)" for tenant "([^"]+)" user "([^"]+)" with key "([^"]+)"$"#
+    regex = r#"^an enqueued extract_fact job "([^"]+)" for tenant "([^"]+)" user "([^"]+)" with key "([^"]+)" and no source$"#
 )]
 async fn given_job_agent(
     world: &mut RecallWorld,
@@ -1719,12 +1716,6 @@ async fn then_wp_no_quarantine(world: &mut RecallWorld, tenant: String) {
 async fn then_wp_quarantine_count(world: &mut RecallWorld, n: u64, tenant: String) {
     let c = wp(world).count_quarantine(&tenant).await;
     assert_eq!(c, n, "quarantine row count mismatch");
-}
-
-#[then("the LLM extractor was not called")]
-async fn then_wp_no_llm(world: &mut RecallWorld) {
-    let calls = wp(world).mocks.extract_call_count().await;
-    assert_eq!(calls, 0, "the LLM extractor must not be called for agent-stated content");
 }
 
 #[then("the persisted contact value is redacted as an email")]
@@ -2813,36 +2804,6 @@ async fn given_system_unchanged(world: &mut RecallWorld, _tenant: String) {
     build_system_harness(world).await;
 }
 
-/// Mount the extract stub returning a fact whose `text` matches the recall query keyword. No source is
-/// attached, so the persisted fact has no `source_id`.
-#[given(
-    regex = r#"^the extractor will return a fact matching "([^"]+)" for the recall query$"#
-)]
-async fn given_system_extract(world: &mut RecallWorld, keyword: String) {
-    let content = serde_json::json!({
-        "subject": "Team Alpha",
-        "predicate": "owns",
-        "object": format!("the {keyword}"),
-        "text": format!("Team Alpha owns the {keyword}")
-    });
-    sys(world).mocks_extract(content).await;
-}
-
-/// Mount the extract stub returning a fact that CITES a source, so the persisted fact carries a
-/// `source_id` linking it to the seeded source.
-#[given(
-    regex = r#"^the extractor will return a sourced fact matching "([^"]+)" for the recall query$"#
-)]
-async fn given_system_extract_sourced(world: &mut RecallWorld, keyword: String) {
-    let content = serde_json::json!({
-        "subject": "Team Alpha",
-        "predicate": "owns",
-        "object": format!("the {keyword}"),
-        "text": format!("Team Alpha owns the {keyword}")
-    });
-    sys(world).mocks_extract_sourced(content).await;
-}
-
 /// Seed a high-trust `Source` (trust 1.0) under the deterministic id the write pipeline derives from
 /// `origin_ref`, so the pipeline's `upsert_source` reuses this trust signal and the gate admits the fact
 /// (a brand-new source would default to a lower trust that quarantines a mid-confidence fact). Mirrors
@@ -2872,20 +2833,6 @@ async fn given_system_trusted_source(
         },
     };
     sys(world).store.put_source(&src).await.expect("seed trusted source");
-}
-
-impl SystemHarness {
-    /// Mount the `/extract` stub returning one fact with the given content (no source).
-    async fn mocks_extract(&self, content: Value) {
-        self._mocks.mount_extract(content, 0.95).await;
-    }
-
-    /// Mount the `/extract` stub returning one fact carrying a `source` so the persisted fact cites it
-    /// (the write pipeline upserts the source from the job payload's `source`). The job payload supplies
-    /// the source; the extract content is the same as the unsourced case.
-    async fn mocks_extract_sourced(&self, content: Value) {
-        self._mocks.mount_extract(content, 0.95).await;
-    }
 }
 
 #[given(
