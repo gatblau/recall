@@ -1,0 +1,21 @@
+# cargo-audit configuration — see https://docs.rs/cargo-audit
+#
+# Each ignored advisory below has NO upstream fix available and is NOT exploitable
+# in recall's usage. Tracked as accepted risks in docs/wip/backlog.md (RISK-010,
+# RISK-011). Re-evaluate whenever the dependency tree changes — remove an entry the
+# moment a fixed upgrade ships so the gate re-fails and forces the bump.
+
+[advisories]
+ignore = [
+    # rsa 0.9.10 — Marvin timing side-channel (medium 5.9). Reaches recall via
+    # jsonwebtoken (RS256 OIDC verify) + surrealdb-core. The attack recovers keys by
+    # timing RSA PRIVATE-key operations; recall only does RS256 signature VERIFICATION
+    # with the IdP public key (no private-key decryption), so it is not exploitable.
+    # No fixed upgrade exists. (RISK-010)
+    "RUSTSEC-2023-0071",
+
+    # tokio-tar 0.3.1 — PAX header file-smuggling. Dev-dependency only (testcontainers);
+    # not compiled into the shipped binary, so no runtime exposure. No fixed upgrade
+    # exists. (RISK-011)
+    "RUSTSEC-2025-0111",
+]
