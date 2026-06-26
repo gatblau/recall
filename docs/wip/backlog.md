@@ -53,8 +53,26 @@
   title: Run the cargo-audit dependency-CVE gate (tool absent in the build env)
   why: the Phase-10 security gate names `cargo audit` alongside secscan, but `cargo-audit` was not installed in the build env. The four mandatory gates (build, lint, integration, secscan) passed; coverage 77.73% ≥ 70%. Install and run before shipping.
   suggested-command: cargo install cargo-audit && cargo audit
-  status: open
+  status: done
   added: 2026-06-21
+  resolution: 2026-06-26 — cargo-audit 0.22.2 installed and run against 637 deps.
+    Found 3 vulnerabilities + 3 unmaintained warnings. RUSTSEC-2026-0185 (quinn-proto
+    0.11.14, HIGH 7.5, runtime via reqwest) FIXED by bumping quinn-proto -> 0.11.15
+    (cargo update -p quinn-proto; build verified). Two residual advisories carried as
+    RISK-010/RISK-011 below — both have no upstream fix and neither is exploitable in
+    recall's usage.
+- id: RISK-010
+  title: rsa 0.9.10 Marvin timing side-channel (RUSTSEC-2023-0071, medium 5.9, no fix)
+  why: reaches recall via jsonwebtoken (RS256 OIDC verify) and surrealdb-core. The attack recovers keys by timing RSA PRIVATE-key operations; recall only performs RS256 signature VERIFICATION with the IdP public key — no private-key decryption — so it is not exploitable here. No fixed upgrade exists.
+  status: accepted
+  recheck: when the rsa crate ships a fix, or jsonwebtoken/surrealdb-core drop the rsa dep.
+  added: 2026-06-26
+- id: RISK-011
+  title: tokio-tar 0.3.1 PAX file-smuggling (RUSTSEC-2025-0111, no fix)
+  why: dev-dependency only (testcontainers) — not compiled into the shipped binary, so no runtime exposure. No fixed upgrade exists.
+  status: accepted
+  recheck: when testcontainers updates its tar dependency, or a fixed tokio-tar ships.
+  added: 2026-06-26
 - id: FU-019
   title: Wire remote SurrealDB credentials (signin) for secured endpoints
   why: FU-009 unified the connection on `engine::any`, but `Store::connect` does not call `signin(Root{...})` and `Config` has no remote-credential fields — a *secured* remote server cannot authenticate (a no-auth endpoint works today). Add `RECALL_STORE_REMOTE_USER`/`RECALL_STORE_REMOTE_PASS` (Secret) config + a `signin` after `connect` when set, and a `use_ns`/`use_db` root-scope check. Deployment-blocking only for secured remote stores; embedded default unaffected.
