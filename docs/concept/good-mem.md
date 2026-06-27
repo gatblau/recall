@@ -1,15 +1,25 @@
 # Building Excellent Agentic Memory
 
 *Status: concept / design-research note. Companion to [`agentic-mem.md`](./agentic-mem.md), which
-covers the concepts, the graph-theory angle, the candidate store (SurrealDB), and the Faraday-facing
+covers the concepts, the graph-theory angle, the candidate store (SurrealDB), and the agent-facing
 REST API. This document goes one level deeper and answers a narrower question: **given all of that,
 how do we make `recall`'s memory not merely functional but genuinely excellent?** Same tone as the
 companion — factual, pragmatic, no marketing. Where the field has a clear answer it is stated; where
 it is unsolved, that is said plainly.*
 
 > Read `agentic-mem.md` first. This note assumes its vocabulary (episodic/semantic/procedural,
-> the bi-temporal model, the write/read/maintain operations, the lazy "learn-as-you-ask" Faraday
+> the bi-temporal model, the write/read/maintain operations, the lazy "learn-as-you-ask"
 > model) and refers back to its sections by number.
+
+> **Architecture update (ADR-014, ADR-015).** This note predates two decisions that reshaped
+> `recall`: freshness/orchestration moved to the agent (ADR-014 — `recall` makes no outbound call),
+> and fact extraction + episodic→semantic consolidation moved to the agent (ADR-015 — `recall` is
+> LLM-free). The *excellence techniques* below still apply; what changed is **who runs them**. Where
+> the text places extraction, consolidation, or the freshness loop **inside `recall`** (notably the
+> §12 blueprint points 2, 3, 5 and the §14 build order), read it as the conceptual pipeline: in the
+> shipped architecture the agent performs those steps and writes the results back as structured,
+> agent-asserted facts; `recall` stores, ranks, serves, supersedes, decays, and re-embeds them.
+> Embedding + reranker remain in `recall` (ADR-012).
 
 ---
 
@@ -50,7 +60,7 @@ workloads** — not against a single QA leaderboard.
 ## 2. The quality bar `recall` specifically has to clear
 
 `recall` is not a generic chatbot memory. It serves the agentic-search process described in
-`agentic-mem.md` §7 (Faraday's learn-as-you-ask model). That imposes four extra, non-negotiable
+`agentic-mem.md` §7 (the learn-as-you-ask model). That imposes four extra, non-negotiable
 quality requirements on top of the generic ones:
 
 1. **Freshness is correctness.** In agentic search, a confidently-returned stale fact is a *wrong
@@ -58,8 +68,8 @@ quality requirements on top of the generic ones:
    circumstances change" failure (e.g. someone changed jobs) is the central named production gap. A
    good `recall` treats currency as a first-class quality dimension, not an afterthought (§5, §8
    below).
-2. **Provenance is mandatory.** Every fact must carry where it came from and when, because Faraday
-   answers cite sources and edit dates, and because provenance is also the backbone of trust and
+2. **Provenance is mandatory.** Every fact must carry where it came from and when, because the
+   surrounding agent platform answers cite sources and edit dates, and because provenance is also the backbone of trust and
    poisoning-defence (§9 below).
 3. **Permissions are inherited, not invented.** Memory quality includes *not leaking* — a fact one
    user is allowed to see must never surface for another. This is layer-4 governance, and it follows
@@ -259,9 +269,10 @@ frequently a bad query. Techniques to bridge the gap:
 
 ### 7.4 Recency weighting and freshness
 Multiply relevance by a recency factor so stale, untouched memories fade in ranking (the Ebbinghaus
-idea applied to retrieval, §8). And for `recall` specifically, fold the **freshness-verification
-loop** (`agentic-mem.md` §7.1: check whether the source changed, refresh if so) into the read so a
-confidently-stale fact is caught before it is returned.
+idea applied to retrieval, §8) — this part is `recall`'s. The **freshness-verification loop**
+(`agentic-mem.md` §7.1: check whether the source changed, refresh if so) is **not**: `recall` runs no
+such check (ADR-014). It returns the provenance the agent needs (`include_provenance`), and the agent
+catches a confidently-stale fact and writes a refreshed one.
 
 ### 7.5 Retrieval gating — did it actually help?
 Excellent systems do not blindly inject whatever stage 2 returns. They **gate**: if the best
@@ -320,7 +331,7 @@ doing it well is genuinely differentiating, not table stakes.
 Adversaries can inject malicious "facts" through ordinary query interactions that corrupt long-term
 memory and steer future behaviour. Reported injection success rates are *over 95%* under favourable
 conditions. For an agentic-search system that *learns from documents*, a booby-trapped document is
-exactly the vector — which is why Faraday marks returned data untrusted (`agentic-mem.md` §7.2).
+exactly the vector — which is why the broker marks returned data untrusted (`agentic-mem.md` §7.2).
 
 ### 9.2 The defences worth building
 - **Write-gate validation** (§4.6) — composite trust scoring across orthogonal signals before
@@ -370,8 +381,9 @@ practice:
   ~400ms inside a few-second window; async/batch work has no tight ceiling. Similarity search itself
   should be **sub-50ms** even over millions of vectors, or it eats the whole budget before reranking
   runs.
-- **Async-by-default writes** (§3, §4.2). The single biggest latency win: keep extraction and
-  consolidation off the response path; single-pass extraction cuts write-time LLM calls 60–70%.
+- **Async-by-default writes** (§3, §4.2). The single biggest latency win: keep the write path off the
+  response path. In `recall` this is doubly true — extraction and consolidation are agent-side
+  (ADR-015), so `recall`'s write path makes no LLM call at all.
 - **Token efficiency is the cost story.** The strongest reported systems answer using **~6,900 tokens
   per query versus ~26,000 for full-context** baselines — memory is partly a *cost-reduction*
   technique, not only a capability one. Return only what is needed (the API discipline of
@@ -395,18 +407,19 @@ in the repo yet — `recall` is greenfield — so treat them as a design target,
 1. **Store:** one hybrid multi-model store (SurrealDB is the §9 candidate in `agentic-mem.md`) holding
    a **bi-temporal knowledge graph** with vector and BM25 indexes; rich edges carry validity
    interval, ingestion time, confidence, salience, and source.
-2. **Write path (async):** filter → single-pass structured extraction (including agent-stated facts)
-   → normalise → resolve identity (rules→ML→LLM) → score importance + confidence → **write-gate**
-   trust check → store. Contradiction resolution deferred to maintenance.
-3. **Maintenance (idle/background):** surprise-weighted consolidation (episodic→semantic) with
-   external validation before promotion and uncertainty-decay on inferences; bi-temporal supersession
-   of contradictions; Ebbinghaus decay with a salience floor; auditable selective forgetting;
-   re-embedding.
+2. **Write path (async):** accept **agent-asserted structured facts** (extraction is the agent's, not
+   `recall`'s — ADR-015) → filter → normalise → resolve identity (rules→ML) → score importance +
+   confidence → **write-gate** trust check → store. Contradiction resolution deferred to maintenance.
+3. **Maintenance (idle/background):** bi-temporal supersession of contradictions; Ebbinghaus decay
+   with a salience floor; auditable selective forgetting; re-embedding. Consolidation
+   (episodic→semantic) is **not** `recall`'s — the agent distils insights with external validation
+   and uncertainty-decay and writes them back as `consolidated` facts (ADR-015).
 4. **Read path (sync, LLM-free, <~200ms):** query reformulation → multi-signal stage-1 recall
    (semantic + BM25 + graph) with metadata filters → cross-encoder rerank of top-k → retrieval gate →
-   recency/freshness check → return ranked facts **with provenance and confidence**.
-5. **Freshness:** server-side ask→check→refresh→answer loop (`agentic-mem.md` §7.1), conditional
-   requests for cheap currency checks.
+   recency weighting → return ranked facts **with provenance and confidence**.
+5. **Freshness:** `recall` runs no loop (ADR-014); on request it returns each sourced fact's
+   `origin_ref` + `modification_marker` so the **agent** runs ask→check→refresh itself. A fact fetch
+   supports conditional requests for cheap "stored-fact changed?" checks.
 6. **Governance throughout:** provenance on every fact, per-user scoping and permission inheritance,
    trust-aware retrieval, PII redaction, audit log, verifiable deletion.
 7. **Control:** heuristic to begin; instrument for a later move to prompted/learned control where it
@@ -447,16 +460,19 @@ stale fact is returned as truth?**
 Excellence is reached incrementally; trying to build all of the above at once is how projects stall.
 A sensible crawl-walk-run, each stage shippable:
 
-1. **Crawl — a memory that works and is honest.** Hybrid store; structured single-pass extraction;
-   two-stage retrieval (multi-signal + rerank); provenance on every fact; per-user scoping;
-   heuristic control; async writes. Measure layers 1–3. This already beats most "stuff text in a
-   vector DB" systems.
+1. **Crawl — a memory that works and is honest.** Hybrid store; ingest of agent-asserted structured
+   facts (extraction is the agent's — ADR-015); two-stage retrieval (multi-signal + rerank);
+   provenance on every fact; per-user scoping; heuristic control; async writes. Measure layers 1–3.
+   This already beats most "stuff text in a vector DB" systems.
 2. **Walk — a memory that stays true over time.** Add the bi-temporal model and supersession;
-   Ebbinghaus decay with a salience floor; freshness-verification loop; write-gate trust check;
-   audit log and verifiable deletion. Now temporal/knowledge-update quality and governance are real.
-3. **Run — a memory that gets smarter.** Add surprise-weighted offline consolidation with external
-   validation and uncertainty decay; retrieval gating; semantic cache and prefetch; and — only where
-   instrumentation shows heuristics leaving quality on the table — prompted or learned control.
+   Ebbinghaus decay with a salience floor; provenance returned on request so the **agent** runs its
+   freshness loop (ADR-014); write-gate trust check; audit log and verifiable deletion. Now
+   temporal/knowledge-update quality and governance are real.
+3. **Run — a memory that gets smarter.** The smarter layer is **agent-side** (ADR-015): the agent
+   does surprise-weighted consolidation with external validation and uncertainty decay and writes
+   insights back as `consolidated` facts. In `recall`, add retrieval gating; semantic cache and
+   prefetch; and — only where instrumentation shows heuristics leaving quality on the table —
+   prompted or learned control.
 
 At each step, the evaluation harness (§13) tells you whether the added complexity actually moved
 layer-1 success, or just added moving parts. That feedback loop — not any single technique — is what

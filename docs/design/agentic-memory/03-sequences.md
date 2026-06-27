@@ -8,7 +8,7 @@ Logical order-of-operations for the four principal flows. Payload detail is defe
 
 ```mermaid
 sequenceDiagram
-    participant Broker as Faraday broker (as user)
+    participant Broker as Broker (as user)
     participant API as HTTP API + Auth
     participant Ret as Retrieval Engine
     participant Embed as Embedding provider
@@ -50,7 +50,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Broker as Faraday broker (as user)
+    participant Broker as Broker (as user)
     participant API as HTTP API + Auth
     participant Q as Durable work queue
     participant WP as Write Pipeline
@@ -102,7 +102,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Broker as Faraday broker (as user)
+    participant Broker as Broker (as user)
     participant API as HTTP API + Auth
     participant MW as Maintenance Worker
     participant Store as Memory Store

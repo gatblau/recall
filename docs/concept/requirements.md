@@ -1,9 +1,11 @@
 # `recall` — Requirements (Functional & Non-Functional)
 
-*Status: draft requirements, concept stage. Derived from the concept notes
-[`agentic-mem.md`](./agentic-mem.md) (concepts, graph model, SurrealDB candidate, Faraday-facing
-API) and [`good-mem.md`](./good-mem.md) (how to make the memory excellent). Same tone — factual,
-pragmatic, no marketing. `recall` is greenfield; nothing here describes existing code.*
+*Status: requirements, reconciled to the design on 2026-06-26. Originally derived from the concept
+notes [`agentic-mem.md`](./agentic-mem.md) (concepts, graph model, SurrealDB candidate, agent-facing
+API) and [`good-mem.md`](./good-mem.md) (how to make the memory excellent), then reconciled to the
+HLD (rev 0.6.0) after **ADR-014** (freshness is agent-side) and **ADR-015** (`recall` is LLM-free)
+reversed two concept-stage positions. Same tone — factual, pragmatic, no marketing. Where a
+requirement was superseded by a decision, it now traces forward to that ADR.*
 
 This document states **what `recall` must do** and **the qualities it must have**, not how to build
 it. Each requirement has a stable ID, a priority, and (where useful) a trace back to the concept
@@ -20,7 +22,7 @@ them current and consistent over time, and does so under per-user access control
 
 **Out of scope** (owned elsewhere or explicitly deferred):
 - The sandbox, credential broker, system allowlist, and audit infrastructure that *call* `recall` —
-  these live in Faraday (`agentic-mem.md` §7.2). `recall` is a well-behaved allowlisted endpoint, not
+  these belong to the surrounding agent platform (`agentic-mem.md` §7.2). `recall` is a well-behaved allowlisted endpoint, not
   the broker.
 - The agent/LLM that decides *what to ask* `recall`. `recall` serves memory; it is not the agent.
 - Learned (RL-based) memory control — a later frontier (`good-mem.md` §10), not a launch requirement.
@@ -28,7 +30,7 @@ them current and consistent over time, and does so under per-user access control
 **Binding assumptions** (documented decisions, per the project's "assumptions over questions" rule;
 each may be revisited but is treated as settled unless changed):
 
-- **A1 — Identity is supplied, not minted.** Callers reach `recall` through the Faraday broker, which
+- **A1 — Identity is supplied, not minted.** Callers reach `recall` through the broker, which
   authenticates as the end user and injects a bearer token. `recall` validates that token and never
   handles raw user credentials (`agentic-mem.md` §7.2, §11.2 P3).
 - **A2 — OIDC is the authentication standard.** Tokens are OIDC-issued JWTs validated against a
@@ -37,8 +39,8 @@ each may be revisited but is treated as settled unless changed):
 - **A3 — Multi-tenant by user.** Every fact belongs to an owning scope (a user, and/or an
   organisation/tenant). Cross-scope leakage is a defect, not a tuning parameter (`good-mem.md` §2).
 - **A4 — Hybrid store with a temporal model.** The store provides graph, vector, and keyword
-  retrieval and can hold bi-temporal facts (`agentic-mem.md` §4–§5). SurrealDB is the leading
-  candidate (`agentic-mem.md` §9) but is not yet committed.
+  retrieval and can hold bi-temporal facts (`agentic-mem.md` §4–§5). **SurrealDB is committed** as the
+  single multi-model store (ADR-003, ADR-009).
 - **A5 — Read path is synchronous and fast; write/maintenance is asynchronous** (`good-mem.md` §3).
 
 ---
@@ -56,8 +58,10 @@ each may be revisited but is treated as settled unless changed):
   **ingestion time**, **confidence score**, and **importance/salience score** (`good-mem.md` §4.5).
 - **FR-W4 (MUST)** — Writes MUST be **idempotent** when an `Idempotency-Key` is supplied: a replay
   returns the original result and creates no duplicate (`agentic-mem.md` §11.2 P5).
-- **FR-W5 (SHOULD)** — `recall` SHOULD support extracting structured facts from supplied unstructured
-  content (single-pass extraction), deferring conflict resolution to maintenance (`good-mem.md` §4.2).
+- **FR-W5 (MUST)** — `recall` MUST accept **agent-asserted structured facts** and performs **no
+  server-side LLM extraction**; turning unstructured content into structured assertions is the agent's
+  responsibility (ADR-015, supersedes the original single-pass-extraction requirement). Conflict
+  resolution is still deferred to maintenance (`good-mem.md` §4.2).
 - **FR-W6 (SHOULD)** — `recall` SHOULD record agent-stated facts (confirmations, conclusions), not
   only user-stated ones (`good-mem.md` §4.3).
 - **FR-W7 (MUST)** — `recall` MUST apply a **write gate**: content from an untrusted source is
@@ -86,22 +90,31 @@ each may be revisited but is treated as settled unless changed):
 
 ### 1.3 Freshness
 
-- **FR-F1 (MUST)** — On retrieval, `recall` MUST be able to run the freshness loop — check whether the
-  underlying source changed, refresh the affected fact, then answer — and indicate what, if anything,
-  was refreshed (`agentic-mem.md` §7.1, `good-mem.md` §7.4).
+- **FR-F1 (MUST)** — `recall` MUST make **no** source-change check and **no** outbound call; it runs no
+  freshness loop (ADR-014, supersedes the recall-side loop of the original requirement). Instead, on
+  request (`include_provenance`) it MUST return each sourced fact's `origin_ref` +
+  `modification_marker` so the **agent** — which holds the local broker and document access — runs
+  ask → check → refresh itself, writing a fresh superseding fact when a source changed
+  (`agentic-mem.md` §7.1, `good-mem.md` §7.4).
 - **FR-F2 (SHOULD)** — `recall` SHOULD support **conditional requests** (`ETag` / `If-Modified-Since`)
-  for cheap currency checks without a full re-read (`agentic-mem.md` §11.2 P6).
+  on a fact fetch (`GET /v1/memories/{id}`) so a caller can cheaply tell whether a *stored fact*
+  changed. The *source-document* currency check is the agent's, against its own broker — never
+  `recall`'s (ADR-014; `agentic-mem.md` §11.2 P6).
 
 ### 1.4 Consolidation and maintenance (asynchronous)
 
 - **FR-C1 (MUST)** — `recall` MUST detect and resolve contradictions using **supersession**, not
   destructive overwrite: a superseded fact's validity is ended and the successor recorded; history
   remains queryable (`agentic-mem.md` §5.2, `good-mem.md` §5).
-- **FR-C2 (SHOULD)** — `recall` SHOULD run background **consolidation** that distils recurring
-  episodic facts into semantic facts (`good-mem.md` §6.1–§6.2).
-- **FR-C3 (MUST, if consolidation is enabled)** — Consolidated/inferred facts MUST be **validated
-  against their source facts before promotion**, MUST carry lower or decaying confidence, and MUST
-  NOT outrank the verified facts they derive from (`good-mem.md` §6.3).
+- **FR-C2 (MUST NOT)** — `recall` MUST run **no** server-side consolidation and make no LLM call
+  (ADR-015, supersedes the original background-consolidation requirement). The **agent** distils
+  recurring episodes into an insight with its own model and writes it back as an agent-stated
+  `consolidated` fact; `recall` stores and serves it, retaining the `consolidated` class +
+  `derived_from` for exactly this (`good-mem.md` §6.1–§6.2).
+- **FR-C3 (MUST)** — Validating a consolidated/inferred fact against its source facts before it is
+  written is the **agent's** responsibility (consolidation is agent-side — ADR-015). `recall` MUST
+  still enforce that a consolidated fact carries lower or decaying confidence and **never outranks the
+  verified facts it derives from** (ADR-006; `good-mem.md` §6.3).
 - **FR-C4 (SHOULD)** — `recall` SHOULD perform **entity resolution and deduplication** as distinct
   steps (normalise → deduplicate → resolve identity), not a single fuzzy match (`good-mem.md` §4.4).
 
@@ -120,7 +133,9 @@ each may be revisited but is treated as settled unless changed):
 ### 1.6 API and discoverability
 
 - **FR-A1 (MUST)** — `recall` MUST expose a **network API over HTTP** with a small set of task-shaped
-  endpoints (recall / remember / forget / freshness-check) (`agentic-mem.md` §11.2 P1, §11.3).
+  endpoints (recall / remember / retire / get-fact / delete). There is no standalone freshness-check
+  endpoint — provenance rides on the recall response and a fact fetch supports conditional requests
+  (ADR-014; `agentic-mem.md` §11.2 P1, §11.3).
 - **FR-A2 (MUST)** — The API MUST be **self-describing**: a machine-readable contract (OpenAPI/JSON
   Schema) and a capabilities endpoint, so an agent can call it without external documentation
   (`agentic-mem.md` §11.2 P2).
@@ -149,8 +164,9 @@ each may be revisited but is treated as settled unless changed):
   size, excluding network time to the caller (`good-mem.md` §3, §11).
 - **NFR-P3 (SHOULD)** — Vector similarity search SHOULD complete in **≤ 50 ms** at the target corpus
   size (`good-mem.md` §11).
-- **NFR-P4 (MUST)** — Extraction, consolidation, and re-embedding MUST run **off the read path**
-  (asynchronously) (`good-mem.md` §3, NFR-P1).
+- **NFR-P4 (MUST)** — `recall`'s asynchronous duties — re-embedding, supersession, graceful decay, and
+  verifiable hard delete — MUST run **off the read path** (`good-mem.md` §3, NFR-P1). Extraction and
+  consolidation are not `recall`'s duties at all; they run at the agent (ADR-015).
 - **NFR-P5 (SHOULD)** — A typical recall response SHOULD stay within a **bounded token budget** (target
   on the order of single-digit thousands of tokens, not tens of thousands) (`good-mem.md` §11).
 
@@ -167,8 +183,9 @@ each may be revisited but is treated as settled unless changed):
 
 - **NFR-AV1 (MUST)** — A failure in the asynchronous write/maintenance path MUST NOT take down the
   synchronous read path.
-- **NFR-AV2 (MUST)** — All external calls (store, embedding, source freshness checks) MUST have
-  **timeouts**, and transient failures MUST use **bounded retry with backoff** (project rule C9).
+- **NFR-AV2 (MUST)** — All external calls `recall` makes — the store and the read-path model providers
+  (embedding + reranker) — MUST have **timeouts**, and transient failures MUST use **bounded retry
+  with backoff** (project rule C9). `recall` makes no source-freshness call (ADR-014).
 - **NFR-AV3 (MUST)** — Writes MUST be **retry-safe** (FR-W4) so a client/broker retry never corrupts
   state.
 
@@ -214,8 +231,10 @@ each may be revisited but is treated as settled unless changed):
 
 ### 2.7 Cost
 
-- **NFR-CO1 (SHOULD)** — Write-time LLM usage SHOULD be minimised (e.g. single-pass extraction)
-  (`good-mem.md` §4.2, §11).
+- **NFR-CO1 (MUST)** — `recall` has **no LLM dependency**: it makes no LLM call on any path and
+  requires no LLM provider to run (ADR-015, supersedes the "minimise write-time LLM usage"
+  requirement). The only model inferences are embedding + reranker on the read path (`good-mem.md`
+  §4.2, §11).
 - **NFR-CO2 (SHOULD)** — `recall` SHOULD cache results for repeated/semantically-similar queries to
   cut redundant cost and latency (`good-mem.md` §11).
 
@@ -246,7 +265,7 @@ each may be revisited but is treated as settled unless changed):
 
 **Yes — OIDC is the right choice, and it is adopted (assumption A2).** The reasoning:
 
-- `recall` sits behind the Faraday broker, which already authenticates as the end user and makes the
+- `recall` sits behind the broker, which already authenticates as the end user and makes the
   call on their behalf (`agentic-mem.md` §7.2). The clean way to convey "this call is user X" across
   a service boundary is a **signed bearer token**, and OIDC (OAuth 2.0 + identity layer) is the
   industry-standard, IdP-agnostic way to issue and validate one.
@@ -277,7 +296,7 @@ Concrete requirements:
   (`jti`) — never the token itself (NFR-SEC3).
 
 What remains open (not blocking adoption): the **specific identity provider** the deployment uses and
-the **exact claim set** the Faraday broker emits (subject format, scope/role claims, audience value).
+the **exact claim set** the broker emits (subject format, scope/role claims, audience value).
 `recall` should be built IdP-agnostic against the OIDC standard; the concrete values are configuration
 and are tracked in §8.
 
@@ -285,7 +304,7 @@ and are tracked in §8.
 
 ## 5. Out of scope (restated for clarity)
 
-- The broker, sandbox, system allowlist, and Faraday-side audit (`agentic-mem.md` §7.2).
+- The broker, sandbox, system allowlist, and broker-side audit (`agentic-mem.md` §7.2).
 - The calling agent / LLM reasoning.
 - Learned (RL) memory control at launch (`good-mem.md` §10) — heuristic control is the requirement.
 - Multimodal memory (image/audio) — text/structured facts only at launch.
@@ -318,13 +337,19 @@ authenticated, authorised, and audited; and a deletion request is verifiably hon
 
 ## 8. Open questions
 
-- **OQ1 — Identity provider & claims.** Which OIDC IdP, and the exact claim set / audience the Faraday
-  broker emits (§4). `recall` is IdP-agnostic; values are configuration.
-- **OQ2 — Store commitment.** SurrealDB vs. dedicated graph + separate vector index (`agentic-mem.md`
-  §9.5 spike) — decide after benchmarking the three query shapes.
+**Still open:**
+
+- **OQ1 — Identity provider & claims.** Which OIDC IdP, and the exact claim set / audience the
+  broker emits (§4). `recall` is IdP-agnostic; values are configuration. (Tracked as FU-011.)
 - **OQ3 — Target volumes & SLAs.** Concrete corpus size and tenant counts behind NFR-S1/NFR-P2.
-- **OQ4 — Tenancy granularity.** User-only, or user-within-organisation, and how org-shared facts are
-  modelled (FR-T1).
-- **OQ5 — Freshness loop placement.** How much of ask→check→refresh→answer runs inside `recall`
-  versus the broker (`agentic-mem.md` §12).
-- **OQ6 — Consolidation cadence.** On write, on timer, or on idle (`good-mem.md` §6.2).
+  (Tracked as FU-007.)
+
+**Resolved during design (kept for the audit trail):**
+
+- **OQ2 — Store commitment.** RESOLVED — SurrealDB, a single multi-model store (ADR-003, ADR-009).
+- **OQ4 — Tenancy granularity.** RESOLVED — bridge model: namespace-per-tenant hard boundary +
+  logical team/user scoping (ADR-011).
+- **OQ5 — Freshness loop placement.** RESOLVED — entirely at the agent; `recall` runs none of it
+  (ADR-014).
+- **OQ6 — Consolidation cadence.** RESOLVED — not applicable; `recall` runs no consolidation, so
+  there is no cadence to choose (ADR-015).

@@ -12,13 +12,13 @@ that too.*
 `recall` is going to need a memory. Before we design it, we should agree on what "memory" actually
 means for an agent, what other people have built, and what trade-offs we are signing up for. This
 note pulls together the current thinking on agentic memory, the graph-theory angle, the practical
-mechanics of reading/writing/searching memory, and the specific approach taken by the Faraday
-project (which two of its design docs describe). It is written to be read by an engineer, a
+mechanics of reading/writing/searching memory, and the specific agent environment `recall` is
+designed to operate inside. It is written to be read by an engineer, a
 product person, or a reviewer — no prior background assumed.
 
-Two reference documents from the Faraday project are summarised in section 7, because the user
-asked for them specifically and because their "learn-as-you-ask" model is directly relevant to how
-`recall` might behave.
+That assumed environment — a sandboxed agent, a trusted credential-holding broker, and a
+"learn-as-you-ask" model of enterprise search — is described in section 7, because its model is
+directly relevant to how `recall` might behave.
 
 > **Companion documents:** this note covers the *concepts and building blocks*.
 > [`good-mem.md`](./good-mem.md) goes a level deeper into *how to make the memory excellent* — the
@@ -27,6 +27,16 @@ asked for them specifically and because their "learn-as-you-ask" model is direct
 > distils both notes into numbered functional and non-functional requirements (including the OIDC
 > authentication model) that trace back to the sections here. Read this document first, then
 > `good-mem.md`, then `requirements.md`.
+
+> **Architecture update (ADR-014, ADR-015).** This note predates two decisions that reshaped
+> `recall`. Freshness checking and orchestration moved to the **agent** (ADR-014 — `recall` makes no
+> outbound call and runs no freshness loop), and fact extraction + episodic→semantic consolidation
+> moved to the **agent** (ADR-015 — `recall` is LLM-free). The *technique analysis* below stands;
+> only the **locus** changed. Wherever a section proposes that `recall` extract facts, consolidate
+> insights, or run the freshness loop **server-side**, read it as the conceptual pipeline: in the
+> shipped architecture the agent performs those steps with its own model and writes the results back
+> as structured, agent-asserted facts, and `recall` stores, ranks, and serves them. Embedding +
+> reranker (read-path model inferences) remain in `recall` (ADR-012).
 
 ---
 
@@ -235,15 +245,17 @@ learned, when, and from where.
 
 ---
 
-## 7. Faraday's approach — "learn as you ask"
+## 7. The assumed agent environment — "learn as you ask"
 
-The two Faraday concept documents describe a specific and, for `recall`, directly relevant design.
-It is worth understanding in its own right.
+`recall` is designed to operate inside a specific kind of agent environment — a sandboxed agent, a
+trusted credential-holding broker, and a "learn-as-you-ask" model of enterprise search. That
+environment is worth understanding in its own right, because it shapes what `recall` must and must
+not do.
 
-### 7.1 The core idea (agentic-search.md)
-Faraday reframes enterprise search. The conventional approach pre-indexes every company document
-into a central database on a schedule. Faraday instead **builds memory from the questions people
-actually ask** — it learns lazily.
+### 7.1 The core idea — lazy, question-driven learning
+This model reframes enterprise search. The conventional approach pre-indexes every company document
+into a central database on a schedule. The learn-as-you-ask model instead **builds memory from the
+questions people actually ask** — it learns lazily.
 
 The mechanism:
 
@@ -262,17 +274,17 @@ The mechanism:
   recency and authority.
 - **Transparency.** Answers carry citations and edit dates.
 
-The described evolution over time: on day one the system feels slow (it is reading sources for the
+The expected evolution over time: on day one the system feels slow (it is reading sources for the
 first time); by day thirty common topics are cached in memory; by day one hundred the memory
 reflects how the organisation actually works, and stays current automatically. The cost model is
 inverted from traditional search — **no large up-front indexing investment, cost is paid
 incrementally as questions arrive.**
 
-### 7.2 The safety architecture (agentic-search-faraday.md)
-The second document covers how Faraday does the above without leaking data or getting compromised
-by malicious content. The relevant pieces:
+### 7.2 The safety architecture
+The environment achieves the above without leaking data or getting compromised by malicious
+content. The relevant pieces:
 
-- **Sealed sandbox.** The short scripts the agent writes (described as Python) run in an isolated
+- **Sealed sandbox.** The short scripts the agent writes (typically Python) run in an isolated
   environment with no direct internet, disk, or program-launch access. A booby-trapped document
   therefore cannot reach out or exfiltrate.
 - **Credential-holding broker.** A trusted broker outside the sandbox holds company credentials and
@@ -287,12 +299,12 @@ by malicious content. The relevant pieces:
   document content.
 - **Audit logging.** Every call is recorded for attribution and accountability.
 
-Faraday explicitly scopes itself to the *sandbox + broker + per-user calls + allowlist + audit*
-infrastructure. It deliberately leaves the **memory implementation, the permission-filtering logic,
-and summary storage out of its own scope** — which is exactly the space `recall` would occupy.
+This environment deliberately scopes itself to the *sandbox + broker + per-user calls + allowlist +
+audit* infrastructure. It leaves the **memory implementation, the permission-filtering logic, and
+summary storage out of its own scope** — which is exactly the space `recall` occupies.
 
 ### 7.3 Why this matters for `recall`
-Faraday's model says something opinionated and useful: **a memory does not have to be pre-built. It
+This model says something opinionated and useful: **a memory does not have to be pre-built. It
 can grow from use, verify its own freshness, store facts as a graph, and respect existing
 permissions rather than inventing new ones.** Whether `recall` adopts the full lazy model or a
 hybrid (some pre-indexing of known-hot sources, lazy for the long tail) is a design decision, but
@@ -402,18 +414,20 @@ a reference blueprint (`good-mem.md` §12) and a staged build order (`good-mem.m
    model; vectors for semantic recall; keyword search for exact terms. Don't pick one.
 2. **Adopt the bi-temporal model.** Never destructively overwrite a fact. End its validity and add
    the successor. This gives free history and clean contradiction handling.
-3. **Keep the read path LLM-free and fast.** Put the expensive, LLM-assisted work (extraction,
-   consolidation, summarisation) on the write/background path. Target low-latency retrieval.
+3. **Keep the read path LLM-free and fast.** The expensive, LLM-assisted work (extraction,
+   consolidation, summarisation) runs off the read path — and, in `recall`'s architecture, at the
+   **agent**, not in `recall` (ADR-015). Target low-latency retrieval.
 4. **Make writing selective and provenanced.** Extract structured facts, tag importance and
    confidence, link every memory to its source, and supersede contradictions at write time.
 5. **Treat forgetting as a first-class subsystem.** Decay + TTL + confidence-linked expiry, with a
-   salience floor so important facts survive disuse. Run consolidation as a background job that does
-   the episodic → semantic distillation.
+   salience floor so important facts survive disuse. Consolidation — the episodic → semantic
+   distillation — runs at the **agent**, which writes the insight back as a `consolidated` fact
+   (ADR-015); `recall` stores and serves it.
 6. **Consider the lazy / learn-as-you-ask model.** A freshness-verification loop (check source
    modification, refresh if stale, then answer) keeps memory current without a heavy indexing
    pipeline. A pragmatic middle path: pre-index a small set of known-hot sources, learn the long
    tail lazily.
-7. **Respect existing permissions; don't build a parallel one.** Following Faraday: access source
+7. **Respect existing permissions; don't build a parallel one.** Following the assumed environment: access source
    systems as the requesting user, allowlist reachable systems, mark externally-returned data as
    untrusted, and keep an audit trail. This matters more, not less, if memory feeds decisions.
 8. **Plan for memory safety/governance.** Provenance, validation on the write path, and an audit of
@@ -421,19 +435,19 @@ a reference blueprint (`good-mem.md` §12) and a staged build order (`good-mem.m
 
 ---
 
-## 11. Making `recall`'s REST API trivial to call from a Faraday agent
+## 11. Making `recall`'s REST API trivial to call from an agent
 
 *Note: `recall` has no API yet — the repository is greenfield at the time of writing. Everything
 below is design guidance for the API we are about to build, not a description of something that
 exists. Endpoint names are illustrative proposals, not a fixed contract.*
 
-The goal is narrow and concrete: **a Faraday agent should be able to use `recall`'s memory in a few
+The goal is narrow and concrete: **a sandboxed agent should be able to use `recall`'s memory in a few
 lines of code, without reading documentation, without holding credentials, and without any single
-call being able to do harm.** That goal is shaped by how Faraday actually works (§7), so we design
-to its grain rather than against it.
+call being able to do harm.** That goal is shaped by how the assumed agent environment actually works
+(§7), so we design to its grain rather than against it.
 
-### 11.1 What "called from a Faraday agent" actually means
-Recall the Faraday model from §7.2. The agent writes a short script that runs in a **sealed
+### 11.1 What "called from a sandboxed agent" actually means
+Recall the environment model from §7.2. The agent writes a short script that runs in a **sealed
 sandbox** with no direct internet or disk. It does not hold credentials. A **credential-holding
 broker** makes the authenticated call on the user's behalf, but only to **administrator-allowlisted
 endpoints**, and returned data is treated as **untrusted**. Every design choice below follows from
@@ -456,14 +470,14 @@ keeps the allowlist (and the audit trail) small and legible.
 
 **P2 — Self-describing, so the agent needs no external docs.** Ship a machine-readable contract
 (OpenAPI/JSON Schema) and a single capabilities endpoint (`GET /` returning the available
-operations and their shapes). Because the Faraday agent *writes code* against the API on the fly,
+operations and their shapes). Because the agent *writes code* against the API on the fly,
 a runtime-discoverable schema is the difference between "it just works" and "it needs a human to
 read the manual first."
 
 **P3 — Identity on a header the broker sets; never in the URL or body.** The broker authenticates
 as the requesting user and injects a bearer token (`Authorization: Bearer …`). The API enforces
 per-user permissions **server-side** keyed on that identity — the same "no central master
-permission store, the source enforces access" stance Faraday takes (§7.2). The agent's script
+permission store, the source enforces access" stance the environment takes (§7.2). The agent's script
 constructs no identity and no scope, so a prompt-injected script cannot widen its own access.
 Tokens should be **least-privilege and short-lived** (a token handed out early in a long agent run
 should not still grant broad write access later).
@@ -479,16 +493,17 @@ stores the key with a TTL and returns the original result on replay, so a retry 
 duplicate memory or double-applies a supersession. (This pairs naturally with the supersede-on-write
 policy of §6.1.)
 
-**P6 — Fold the freshness loop into one server-side call.** Faraday's value pattern is *ask → check
-source freshness → update if stale → answer* (§7.1). Rather than make the agent orchestrate those
-four steps, the `recall` endpoint should do them server-side and return the answer plus a note of
-what it refreshed. For the cheap "has anything changed?" case, support conditional requests
-(`ETag` / `If-Modified-Since`) so the agent can verify currency without paying for a full re-read —
-the API-level equivalent of Faraday's modification-date check.
+**P6 — Return the provenance the agent needs to check freshness itself.** The environment's value
+pattern is *ask → check source freshness → update if stale → answer* (§7.1). `recall` does **not**
+run that loop — it makes no outbound call (ADR-014). Instead, on request (`include_provenance`) the
+recall response carries each sourced fact's `origin_ref` + `modification_marker`, so the agent's
+local broker runs the check and writes a superseding fact if the source changed. A fact fetch also
+supports conditional requests (`ETag` / `If-Modified-Since`) for the cheap "has the *stored fact*
+changed?" case.
 
 **P7 — Provenance on every returned fact.** Each recalled item carries its source link, the edit/
 ingestion date, a confidence score, and its validity interval (the §5.2 / §6.1 fields). This serves
-two masters at once: Faraday's transparency requirement (answers cite sources and dates) and the
+two masters at once: the transparency requirement (answers cite sources and dates) and the
 agent's need to judge how much to trust each memory.
 
 **P8 — Treat the response as untrusted data, and make that easy for the caller.** Return structured
@@ -504,7 +519,7 @@ be able to rely on the shape not shifting under them.
 
 **P10 — Agent-aware operational limits.** Agents can emit far more calls than humans. Provide
 agent-tier rate limits with standard headers (`RateLimit-*`, `Retry-After`) the agent can read and
-back off against, and **audit every call** server-side — which aligns with Faraday's own audit
+back off against, and **audit every call** server-side — which aligns with the environment's own audit
 logging (§7.2) and the memory-governance need from §6.3.
 
 ### 11.3 An illustrative endpoint sketch (proposed, not fixed)
@@ -512,21 +527,21 @@ logging (§7.2) and the memory-governance need from §6.3.
 | Operation | Proposed shape | Notes |
 |---|---|---|
 | Discover | `GET /v1` | Returns capabilities + link to OpenAPI; lets the agent write code with no manual. |
-| Recall | `POST /v1/recall` `{ "query": "...", "filters": {...}, "k": 5 }` | Hybrid retrieval (§4.3); server runs the freshness loop (P6); returns ranked facts with provenance (P7). LLM-free read path (§6.2). |
-| Remember | `POST /v1/memories` `{ "fact": {...}, "source": "...", "confidence": 0.8 }` + `Idempotency-Key` | Extract/store structured fact; supersede contradictions server-side (§6.1). |
+| Recall | `POST /v1/recall` `{ "query": "...", "filters": {...}, "k": 5 }` | Hybrid retrieval (§4.3); returns ranked facts with provenance (P7), plus `origin_ref` + `modification_marker` when `include_provenance` is set so the agent checks freshness itself (P6, ADR-014). LLM-free read path (§6.2). |
+| Remember | `POST /v1/memories` `{ "fact": {...}, "source": "...", "confidence": 0.8 }` + `Idempotency-Key` | Store the **agent-asserted** structured fact (no server-side extraction — ADR-015); supersede contradictions server-side (§6.1). |
 | Forget / supersede | `POST /v1/memories/{id}/retire` + `Idempotency-Key` | Ends validity rather than hard-deleting (§5.2); never destructive by default. |
 | Freshness check | `GET /v1/memories/{id}` with `If-Modified-Since` | Cheap currency check (P6) without a full re-read. |
 
-The whole point of the table is that a Faraday agent's script to use memory is roughly *"POST my
+The whole point of the table is that an agent's script to use memory is roughly *"POST my
 question to `/v1/recall`, read back the ranked facts and their sources"* — one call, no credentials,
 no SDK, a response it can trust because every item is provenance-tagged.
 
 ### 11.4 What this does not solve
 The API surface makes `recall` *callable*; it does not make the memory *good* — the write,
 retrieval, consolidation, and forgetting policies of §6 still have to be right behind it. Nor does a
-clean API remove the need for the broker/sandbox/allowlist controls of §7.2; those live in Faraday,
-and `recall` simply has to be a well-behaved allowlisted endpoint that authenticates per user and
-audits every call.
+clean API remove the need for the broker/sandbox/allowlist controls of §7.2; those belong to the
+surrounding agent platform, and `recall` simply has to be a well-behaved allowlisted endpoint that
+authenticates per user and audits every call.
 
 ---
 
@@ -537,18 +552,19 @@ audits every call.
 - **Graph store choice** — a unified multi-model engine (e.g. SurrealDB, §9) vs. dedicated graph
   database + separate vector index vs. graph-on-relational; weigh single-system simplicity against
   specialist maturity, and run the §9.5 spike before committing.
-- **Consolidation cadence** — on every write, on a timer, on idle, or triggered by volume?
+- **Consolidation cadence** — RESOLVED (ADR-015): not applicable to `recall`; consolidation is
+  agent-side, so its cadence is the agent's concern, not `recall`'s.
 - **Forgetting parameters** — decay curve shape, TTL values, salience-floor threshold; these need
   tuning against real usage, not guessed.
 - **Multi-tenant / per-user isolation** — how memory is partitioned and how permissions are
   enforced at retrieval.
 - **Evaluation** — what does "good memory" mean for `recall`, and which benchmark or harness proves
   it (long-memory recall, contradiction handling, freshness)?
-- **API auth and broker integration** (§11) — what token format and scope model does the Faraday
-  broker inject, how short-lived are tokens, and how does `recall` map a caller identity to its
+- **API auth and broker integration** (§11) — what token format and scope model does the broker
+  inject, how short-lived are tokens, and how does `recall` map a caller identity to its
   per-user memory partition and permissions?
-- **Server-side vs. client-side freshness loop** (§11.2 P6) — how much of the ask→check→update→answer
-  loop lives inside `recall` versus being orchestrated by the agent or broker?
+- **Server-side vs. client-side freshness loop** (§11.2 P6) — RESOLVED (ADR-014): the loop runs
+  entirely at the agent; `recall` makes no outbound call and only returns provenance on request.
 
 ---
 
@@ -556,8 +572,6 @@ audits every call.
 
 Concepts and claims above are drawn from the following, accessed June 2026:
 
-- Faraday project — [agentic-search.md](https://github.com/gatblau/faraday/blob/main/docs/concept/agentic-search.md)
-- Faraday project — [agentic-search-faraday.md](https://github.com/gatblau/faraday/blob/main/docs/concept/agentic-search-faraday.md)
 - [Memory Types in Agentic AI: A Breakdown (Medium)](https://medium.com/@gokcerbelgusen/memory-types-in-agentic-ai-a-breakdown-523c980921ec)
 - [Beyond Short-term Memory: The 3 Types of Long-term Memory AI Agents Need (MachineLearningMastery)](https://machinelearningmastery.com/beyond-short-term-memory-the-3-types-of-long-term-memory-ai-agents-need/)
 - [Architecture and Orchestration of Memory Systems in AI Agents (Analytics Vidhya)](https://www.analyticsvidhya.com/blog/2026/04/memory-systems-in-ai-agents/)

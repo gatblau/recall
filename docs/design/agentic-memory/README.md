@@ -10,7 +10,7 @@
 This HLD describes `recall`, a standalone memory service for AI agents. It stores facts learned from
 interactions and source documents, lets an agent write / recall / forget those facts over an
 authenticated HTTP API, keeps them current and consistent over time, and does so under per-user
-access control. It is designed to sit behind the Faraday agentic-search broker — an agent's sandboxed
+access control. It is designed to sit behind the agentic-search broker — an agent's sandboxed
 script calls `recall` through the broker, which injects an OIDC-issued identity. The design is
 forward-looking (greenfield); `recall` does not yet exist in code. The next move is `/spec` against
 this folder to produce the Low-Level Design.

@@ -22,7 +22,7 @@
 | Graceful shutdown | **Applies** — drain in-flight requests, finish or re-enqueue in-flight async jobs, no work lost on restart. |
 | CORS | **Does not apply (default)** — callers are server-side (the broker), not browsers; configurable if a first-party browser client is ever added. |
 | Multi-tenancy | **Applies** — bridge model (ADR-011): namespace-per-tenant hard boundary + logical Team / User visibility within; bi-temporal facts and the vector index isolated per tenant; no cross-tenant leakage. Database-per-team is the escape hatch for teams needing physical isolation. |
-| Outbound calls / orchestration | **Constrained** — `recall` makes **no** outbound call to the broker or source systems and runs **no** agentic-workflow orchestration; freshness checking and source re-reads are the agent's responsibility (ADR-014). The only outbound calls are model-provider inferences: embedding + reranker on the read path, the extraction/consolidation LLM off it (ADR-012). |
+| Outbound calls / orchestration | **Constrained** — `recall` makes **no** outbound call to the broker or source systems and runs **no** agentic-workflow orchestration; freshness checking and source re-reads are the agent's responsibility (ADR-014). `recall` holds **no LLM dependency** — extraction and consolidation are agent-side (ADR-015). The only outbound calls are the two read-path model-provider inferences: embedding + reranker (ADR-012). |
 
 ## Non-functional Requirements
 

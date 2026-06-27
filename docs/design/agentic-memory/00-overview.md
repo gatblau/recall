@@ -8,7 +8,7 @@
 documents, stores them as a bi-temporal knowledge graph with vector and keyword indexes, and serves
 them back over an authenticated HTTP API on a fast, LLM-free read path. The expensive work —
 extraction, consolidation, contradiction resolution, decay — runs asynchronously off the read path.
-`recall` sits behind the Faraday agentic-search broker and inherits per-user identity via OIDC; it
+`recall` sits behind the agentic-search broker and inherits per-user identity via OIDC; it
 holds no raw credentials of its own. This design covers system shape, the memory model, the API
 surface, the authentication model, and cross-cutting governance. Wire-level detail (field types,
 error codes, JSON schemas) is deferred to `/spec`.
@@ -19,7 +19,7 @@ A language model is stateless: each call starts from nothing. An agent that forg
 between invocations cannot remember earlier task context, cannot carry knowledge across sessions, and
 must re-read every source document on every question. The conventional fix — pre-indexing all
 documents into a static store — goes stale, mixes versions, and creates a privacy surface. `recall`
-instead provides a memory that learns from use (the Faraday "learn-as-you-ask" model), surfaces each
+instead provides a memory that learns from use (the "learn-as-you-ask" model), surfaces each
 fact's source and version so the agent can verify freshness, stores facts as relationships rather than
 text blobs, resolves contradictions over time, and respects the access rights of the systems it learns
 from. Without it, agents built on this
@@ -45,7 +45,7 @@ The full reasoning, the survey of existing systems, and the quality techniques a
 
 ## Non-goals
 
-- **The broker, sandbox, system allowlist, and Faraday-side audit** — owned by Faraday, not `recall`.
+- **The broker, sandbox, system allowlist, and broker-side audit** — owned by the surrounding agent platform, not `recall`.
 - **The calling agent / LLM reasoning** — `recall` serves memory; it does not decide what to ask.
 - **Learned (reinforcement-learning) memory control at launch** — heuristic control ships first;
   learned control is a later frontier (see `good-mem.md` §10).
@@ -82,4 +82,4 @@ The full reasoning, the survey of existing systems, and the quality techniques a
 | Tenant | An organisation — the hard isolation boundary; one SurrealDB namespace per tenant, no commingling. | "Acme Corp". |
 | Team | A group within a tenant that may share memory. | Acme's Platform team. |
 | Visibility | Whether a fact is private to its user, shared to a team, or shared across the tenant. | A team-shared runbook fact. |
-| Faraday broker | The trusted component that authenticates as the user and calls `recall` on their behalf; co-located with the agent, it also reads source documents and checks their freshness (never `recall`'s job — ADR-014). | Injects the OIDC bearer token; re-reads a changed document for the agent. |
+| Broker | The trusted component that authenticates as the user and calls `recall` on their behalf; co-located with the agent, it also reads source documents and checks their freshness (never `recall`'s job — ADR-014). | Injects the OIDC bearer token; re-reads a changed document for the agent. |

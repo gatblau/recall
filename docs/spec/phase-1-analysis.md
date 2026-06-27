@@ -115,7 +115,7 @@ domain concept is a candidate for the Phase 3.5 HLD-impact-pass (glossary bubble
 | Tenant | An organisation — the hard isolation boundary; one SurrealDB namespace per tenant. | "Acme Corp". |
 | Team | A group within a tenant that may share memory. | Acme's Platform team. |
 | Visibility | Whether a fact is private to its user, shared to a team, or shared across the tenant. | A team-shared runbook fact. |
-| Faraday broker | The trusted component that authenticates as the user and calls `recall` on their behalf. | Injects the OIDC bearer token. |
+| Broker | The trusted component that authenticates as the user and calls `recall` on their behalf. | Injects the OIDC bearer token. |
 | Source (provenance) | Where a Fact came from — origin reference, modification marker, trust signal. | "document X, last-modified marker `W/\"abc\"`". |
 | Stage-1 recall | Multi-signal candidate retrieval (semantic + keyword + graph) before reranking. | Returns up to 50 candidates for the cross-encoder. |
 | Cross-encoder rerank | A read-path discriminative model inference that reorders stage-1 candidates by relevance — not an LLM call. | Reordering 50 candidates to surface the 10 most relevant. |

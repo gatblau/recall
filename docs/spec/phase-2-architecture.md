@@ -24,7 +24,7 @@ calls (no network, no auth hop) and are labelled `in-proc`.
 
 ```mermaid
 flowchart TB
-    broker["Faraday broker (as user)"]
+    broker["Broker (as user)"]
     idp[(OIDC Identity Provider)]
     embed["Embedding provider"]
     rerank["Reranker (cross-encoder)"]

@@ -2,13 +2,13 @@
 
 > **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
 
-`recall` is a network service called by the Faraday broker on behalf of an end user, backed by a
+`recall` is a network service called by the broker on behalf of an end user, backed by a
 memory store and assisted by external model providers for the asynchronous write/maintenance path.
 
 ```mermaid
 flowchart TB
-    user([End user]) -->|asks the agent| agent[AI agent in Faraday sandbox]
-    agent -->|short script, no credentials| broker[Faraday broker]
+    user([End user]) -->|asks the agent| agent[AI agent (sandboxed)]
+    agent -->|short script, no credentials| broker[Broker]
     broker -->|HTTPS + OIDC bearer token<br/>calls as the user| recall[recall memory service]
 
     idp[(OIDC Identity Provider)] -.->|issues token to broker| broker
@@ -26,13 +26,13 @@ flowchart TB
 
 - **End user** — the human whose question ultimately drives a memory operation. **Interaction:**
   indirect; never talks to `recall` directly. Identity flows through the broker.
-- **AI agent (Faraday sandbox)** — writes the short script that uses memory; runs sealed, holds no
+- **AI agent (sandboxed)** — writes the short script that uses memory; runs sealed, holds no
   credentials. **Performs the reasoning `recall` does not:** it extracts structured facts from content
   and distils episodes into insights with its own LLM, then writes them to `recall` as structured,
   agent-asserted assertions (ADR-015). **Interaction:** indirect, via the broker. Treats `recall`
   responses as untrusted data.
-- **Faraday broker** — the trusted caller, co-located with the agent. Authenticates as the end user,
-  injects an OIDC bearer token, enforces the system allowlist and Faraday-side audit, and reads source
+- **Broker** — the trusted caller, co-located with the agent. Authenticates as the end user,
+  injects an OIDC bearer token, enforces the system allowlist and broker-side audit, and reads source
   documents / checks their freshness on the agent's behalf. **Interaction:** HTTPS to `recall`'s API;
   `Authorization: Bearer <OIDC JWT>`; direction broker→`recall` only — `recall` makes **no** outbound
   call to the broker (ADR-014, superseding the ADR-013 re-entrant check).

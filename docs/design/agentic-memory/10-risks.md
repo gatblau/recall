@@ -53,8 +53,8 @@
 
 ## Dependencies
 
-- **Faraday broker** — authenticates as the user, injects the OIDC token, reads source systems on the
-  user's behalf, runs the system allowlist and Faraday-side audit.
+- **Broker** — authenticates as the user, injects the OIDC token, reads source systems on the
+  user's behalf, runs the system allowlist and broker-side audit.
 - **OIDC Identity Provider** — issues tokens and exposes discovery/JWKS.
 - **Memory store** — the persistence engine (SurrealDB candidate).
 - **Embedding / reranker / LLM providers** — for the async write/maintenance path.

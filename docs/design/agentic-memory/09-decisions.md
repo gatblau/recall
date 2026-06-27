@@ -7,7 +7,7 @@
 ### ADR-001: OIDC bearer-token authentication with broker-injected identity
 - **Decision.** `recall` authenticates every request via an OIDC-issued JWT bearer token, validated
   against the configured issuer's JWKS; identity is taken from a token claim and mapped to a Scope.
-- **Context.** `recall` sits behind the Faraday broker, which authenticates as the end user. Identity
+- **Context.** `recall` sits behind the broker, which authenticates as the end user. Identity
   must cross a service boundary without `recall` ever holding raw credentials, and the agent's
   sandboxed script must not be able to construct or widen its own identity.
 - **Consequences.** Standards-based and IdP-agnostic; `recall` stays credential-free; per-user
@@ -253,7 +253,7 @@
 
 | ID | Area | Assumption | Rationale |
 |---|---|---|---|
-| ASSUMP-IDENTITY | Auth | Identity is supplied by the broker; `recall` validates the token and never handles raw user credentials. | Matches the Faraday broker model (`agentic-mem.md` §7.2). |
+| ASSUMP-IDENTITY | Auth | Identity is supplied by the broker; `recall` validates the token and never handles raw user credentials. | Matches the assumed broker model (`agentic-mem.md` §7.2). |
 | ASSUMP-OIDC | Auth | OIDC JWT is the authentication standard. | Standards-based, IdP-agnostic way to convey user identity across a boundary (ADR-001). |
 | ASSUMP-TENANCY | Tenancy | Memory is segmented Tenant → Team → User via the bridge model (namespace-per-tenant + logical scoping). | Committed via ADR-011; supports hard cross-tenant isolation and intra-tenant sharing. |
 | ASSUMP-STORE-CAP | Storage | The store provides graph + vector + keyword retrieval over rich bi-temporal edges; embedded SurrealDB is the committed engine. | Required capability set (`agentic-mem.md` §4–§5, §9); committed via ADR-003/ADR-009; spike validates (OQ-STORE). |
