@@ -1,7 +1,7 @@
 # Phase 5 — Generation Playbook
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
+> **derivedFromHld:** 0.7.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
 
 The ordered build checklist `codegen` follows, one Playbook step per invocation. Steps respect the
 Phase 2B dependency DAG: every component depends only on lower-numbered steps. The cross-cutting
@@ -55,12 +55,20 @@ bi-temporal edges, **and** exercise the remote SurrealDB/TiKV path through the s
 - [ ] **C6** (`components/retrieval-engine.md`): the read pipeline (embed→stage-1 multi-signal→rerank→recency→gate/abstain→cursor→provenance-attach (conditional, ADR-014)), SA-LAT-01 sub-budgets + degradation. Tests for happy/abstain/rerank-timeout-degrade/store-timeout/provenance-on-off + the p95 budget assertion.
 - [ ] **C7** (`components/maintenance-worker.md`): scheduler (idle via activity probe + fallback timer) + queue-consumer (claims `ReEmbedFact`/`HardDelete`); four duties — supersession, decay (Ebbinghaus + salience floor), re-embed, verifiable hard delete; `maintenance_state`. No consolidation (agent-side, ADR-015). Unit-test the decay pure core against case tables.
 
-## Step 6 — C8 HTTP API Edge (Phase 5)
+## Step 6 — C9 Service Layer + C8 HTTP API Edge (Phase 5/6; ADR-016)
 
-- [ ] **C8** (`components/http-api-edge.md`): axum router for all HLD-08 routes; middleware stack in fixed order — correlation-id → **X12** body-size/validation → **X2** auth(C3) → **X9** rate limit → idempotency (SA-IDEM-01) → handler → audit-emit (SA-AUDIT-01).
+- [ ] **C9 Service Layer** (`components/service-layer.md`): extract the transport-agnostic orchestration into `src/service` — per-operation methods (recall/remember/get_fact/retire/delete/capabilities) running the fixed chain **X2** auth(C3) → authorise → **X9** rate limit → idempotency (SA-IDEM-01) → component → audit-emit (SA-AUDIT-01) → **X1** error-classification, on a verified `ScopeContext`, returning `CallResult`/`AppError`. Single definition of each concern (SA-SVC-01).
+- [ ] **C8 HTTP API Edge** (`components/http-api-edge.md`): refactor `src/api` to a **thin adapter over C9** — axum router for all HLD-08 routes; retains correlation-id → **X12** body-size → bearer-extract → C9 call → render (`Success`/`ErrorEnvelope`, `RateLimit-*`, ETag/conditional-GET, status mapping). External REST contract unchanged.
 - [ ] **X8 Health** (`/healthz`, `/readyz`), **X10 Pagination** (opaque cursor), **X11 CORS** (off by default), generated `GET /openapi.json` (SA-VER-01), `GET /metrics`.
 - [ ] **X13 Graceful Shutdown** — signal handling, drain, worker lease release, store flush.
-- [ ] Tests: per-route happy/edge/error, idempotent replay, rate-limit headers, audit emission, auth/authz matrix.
+- [ ] **Regression gate:** the existing BDD suite (`cargo test --test bdd`) passes **unmodified** — proof the C8 refactor is behaviour-preserving.
+- [ ] Tests: C9 orchestration unit tests with no transport types in scope; per-route happy/edge/error; idempotent replay; rate-limit headers; audit emission; auth/authz matrix.
+
+## Step 6b — C10 MCP API Edge (Phase 6; ADR-016)
+
+- [ ] **C10 MCP API Edge** (`components/mcp-api-edge.md`): new binary `recall-mcp` (`src/mcp`); add the `[[bin]]` target and a maintained Rust MCP library (OQ-LIB) to `Cargo.toml`; build the same `build_state`, construct `Service` (C9), serve MCP over streamable-HTTP at `RECALL_MCP_HTTP_ADDR`+`RECALL_MCP_PATH`.
+- [ ] One tool per operation (recall/remember/get/retire/delete/capabilities) + `tools/list`; input schemas generated from the same 2C types that back the OpenAPI document; bearer from the HTTP `Authorization` header; `AppError`→MCP-error using the same registry `code` as REST (SA-MCP-MAP-01).
+- [ ] Tests: tool happy/edge/error; `tools/list` schema parity; idempotent replay over MCP; **error-code parity with the REST edge** (same input → same `code`); identity-enforced (no bearer → `AUTH_MISSING_TOKEN`, no audit).
 
 ## Step 7 — Integration & verification (whole-system gate)
 
@@ -81,9 +89,14 @@ Step 2  C1 Memory Store (+X7)             │  Phase 1
 Step 3  C2 Work Queue · C3 Auth & Scope   │  Phase 2  (parallel)
 Step 4  C4 Write Pipeline                 │  Phase 3  (C5 retired, ADR-014)
 Step 5  C6 Retrieval · C7 Maintenance     │  Phase 4  (parallel)
-Step 6  C8 HTTP API Edge (+X2,X8–X13)     │  Phase 5
+Step 6  C9 Service Layer → C8 HTTP Edge    │  Phase 5/6  (+X2,X8–X13; C8 thin adapter over C9, ADR-016)
+Step 6b C10 MCP API Edge (bin recall-mcp)  │  Phase 6    (second edge over C9, ADR-016)
 Step 7  Integration & verification        ┘  whole-system gate
 ```
+
+> **ADR-016 build note.** C9 must land before C8's refactor and before C10. C8's refactor is gated by
+> the existing BDD suite passing unmodified (behaviour-preserving). C10 depends only on C9 and can be
+> built in parallel with C8's refactor once C9 exists.
 
 No cycles: each step depends only on lower-numbered steps. The async write path means C8 never calls
 C4 synchronously — it enqueues on C2, so there is no C8→C4 edge.

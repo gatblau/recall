@@ -3,7 +3,7 @@
 **File:** `src/queue` | **Package:** `recall::queue` | **Phase:** 2 | **Dependencies:** C1 Memory Store
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.6.0
+> **derivedFromHld:** 0.7.0
 
 #### Purpose
 

@@ -1,7 +1,7 @@
 # Phase 6 — Self-Audit
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
+> **derivedFromHld:** 0.7.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015), 2026-06-27 (RFC 01-MCP, ADR-016)
 
 This is the blocking gate that promotes the spec set from *Draft* to *Approved*. Each checklist item
 is ticked against the generated specs (Phases 1–5). **Verdict: PASS** — every item is `[x]`.
@@ -119,13 +119,50 @@ The checklist was re-run against the LLM-free set and still passes; affected ite
     phase (verified by scan — zero `0.4.x`/`0.5.x` pins remain).
 21. **Changelog coverage.** The HLD bumps to 0.5.0 (RFC 01 / ADR-014: passive store, agent-side
     freshness) and 0.6.0 (RFC 02 / ADR-015: LLM-free, extraction + consolidation agent-side) each have a
-    matching `99-changelog.md` line. README and all child banners read 0.6.0 (D-HLD-5 sibling consistency
+    matching `99-changelog.md` line. README and all child banners read 0.7.0 (D-HLD-5 sibling consistency
     holds; D-HLD-6 satisfied).
+
+## ADR-016 re-audit (RFC 01-MCP — MCP edge + shared Service Layer, 2026-06-27)
+
+Scoped re-audit of the change that adds C9 (Service Layer) and C10 (MCP API Edge) and refactors C8 to
+a thin adapter. Every checklist item re-verified against the changed scope:
+
+```
+[x] Every entity has a complete data model — C9/C10 own no tables (N/A stated); reused 2C types defined.
+[x] Every action has inputs/outputs/numbered steps/errors — C9 (6 methods) and C10 (6 tools) each have Public Interface + numbered Internal Logic + Error Table.
+[x] No banned phrases — re-scanned service-layer.md, mcp-api-edge.md, http-api-edge.md (the "handles" verbs reworded).
+[x] ≥3 Gherkin per component — C9 has 4, C10 has 5.
+[x] Error table ≥2 rows — C9 14 rows, C10 9 rows.
+[x] Cross-component interaction on BOTH sides — C8 addendum + C10 spec both declare dependency on C9; C9 documents being consumed by both edges; C9↔C1/C2/C3/C6 ports duplicated in Shared Context.
+[x] Build order is a valid DAG — C9 depends on C1/C2/C3/C6 (phase 5); C8, C10 depend only on C9 (phase 6). No cycle (phase-2 §2B DAG updated).
+[x] Env vars typed/default/required/owner — RECALL_MCP_HTTP_ADDR, RECALL_MCP_PATH added (owner C10); idempotency + rate vars reassigned owner C8→C9.
+[x] Each spec self-contained — C9/C10 duplicate ScopeContext, AppError, DTOs, config into Shared Context.
+[x] Assumptions complete; OQs blocking-only — SA-SVC-01/SA-MCP-*/SA-BIN-01 added; OQ-LIB, OQ-NAME non-blocking.
+[x] Example I/O — C9 and C10 each carry a concrete Example.
+[x] Shared types — C9's CallContext/CallResult/RateSnapshot are C9-owned public-interface types, defined in C9 and duplicated into C10's Shared Context (consumed only by the two edges).
+[x] Security for every entry point — C9 (service), C8 (HTTP), C10 (MCP) each have a Security subsection; identity is always a C3-derived ScopeContext, never request-supplied.
+[x] Performance targets — C9 and C10 each carry the ≤5 ms in-process overhead budget (SA-LAT-01).
+[x] en-GB throughout.
+[x] Destructive schema — N/A (no DDL introduced).
+[x] derivedFromHld present — C8/C9/C10 = 0.7.0; all phase + cross-cutting + component specs re-pinned to 0.7.0.
+[x] No ADR-shaped paragraph in spec bodies — the Approach sections use the allowed chosen/rejected form; the full ADR-016 lives in HLD 09-decisions.md (promoted via the HLD-impact-pass).
+[x] Every glossary term in the HLD glossary — MCP, Service Layer, MCP API edge added to HLD 00-overview.md; "Transport edge" is an [LLD] term (not required in HLD).
+[x] derivedFromHld matches current revision — HLD now 0.7.0; all specs re-pinned to 0.7.0 (additive delta, orthogonal to C1–C7/X1–X13 content).
+[x] Folder-form HLD: revision bump recorded — 99-changelog.md has the 0.7.0 line; all child banners + README read 0.7.0 (D-HLD-5 sibling consistency holds; D-HLD-6 satisfied).
+```
+
+New-component *Gaps*: `service-layer.md` — None; `mcp-api-edge.md` — None. No `[Gap]` outstanding.
 
 ## Verdict
 
-**PASS — the spec set is promoted from *Draft* to *Approved*.** All Component specs have empty *Gaps*;
-no Open Question is blocking. `/breakdown` may consume `docs/spec/phase-5-playbook.md`.
+**PASS — the spec set (including the ADR-016 additions) is *Approved*.** All Component specs have
+empty *Gaps*; no Open Question is blocking (OQ-LIB / OQ-NAME are non-blocking, resolved at codegen).
+`/breakdown` may consume `docs/spec/phase-5-playbook.md` — the ADR-016 work is Steps 6 (C9 → C8
+refactor) and 6b (C10).
+
+**One build-order precondition (not a spec blocker):** the OQ-STORE spike (Phase 5, Step 0) is
+load-bearing for ADR-009 and must run **before** Rust scaffolding — a spike failure reopens ADR-003 and
+ADR-009 and returns the work to `/design`.
 
 **One build-order precondition (not a spec blocker):** the OQ-STORE spike (Phase 5, Step 0) is
 load-bearing for ADR-009 and must run **before** Rust scaffolding — a spike failure reopens ADR-003 and

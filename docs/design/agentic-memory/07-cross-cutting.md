@@ -1,6 +1,6 @@
 # 07 — Cross-cutting Concerns & NFRs
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 ## Cross-cutting Concerns
 

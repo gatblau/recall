@@ -3,7 +3,7 @@
 **File:** `src/write_pipeline` | **Package:** `recall::write_pipeline` | **Phase:** 3 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.6.0
+> **derivedFromHld:** 0.7.0
 
 #### Purpose
 

@@ -1,6 +1,6 @@
 # 09 — Architectural Decisions, Assumptions & Open Questions
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 ## Architectural Decisions
 
@@ -248,6 +248,34 @@
 - **Alternatives considered.** Relocate consolidation to a separate worker (rejected — adds a deployable
   and keeps an LLM in the system). LLM-free heuristic consolidation (rejected — weak insights). Keep
   server-side LLM extraction/consolidation (rejected — contradicts ADR-014's passive-store direction).
+
+### ADR-016: One service core, two transport edges (REST + MCP); MCP over streamable-HTTP reusing OIDC
+- **Decision.** Extract the per-operation orchestration — authenticate→`ScopeContext`, authorise the
+  operation class, rate-limit, idempotency, invoke the owning component, write the audit record, and
+  classify any failure to an X1 `code` — into a transport-agnostic **Service Layer**. Expose it through
+  two thin edges in **two binaries**: the existing **REST** edge (`recall`) and a new **MCP** edge
+  (`recall-mcp`). The MCP edge runs over **MCP streamable-HTTP** and carries the same
+  `Authorization: Bearer <OIDC JWT>` the REST edge validates, so the Auth & Scope component is reused
+  verbatim. Both binaries construct their state from the same bootstrap path; neither holds a private
+  copy of the orchestration. Introduced by RFC 01.
+- **Context.** Agents increasingly consume tools over MCP; `recall` must offer an MCP interface without
+  forking the service. The orchestration that makes `recall` correct and governable (auth, scope, rate
+  limiting, idempotency, audit) must exist **once** — a second copy is a security and correctness
+  hazard. `recall` is a central, multi-tenant, OIDC-authenticated store; the per-agent-local component
+  is the broker, not `recall`. A networked, bearer-authenticated MCP edge therefore fits its nature and
+  reuses all governance unchanged.
+- **Consequences.** A single source of truth for auth/scope/rate/idempotency/audit; the REST contract
+  is unchanged (the HTTP edge becomes a thin adapter, proven behaviour-preserving by the existing BDD
+  suite passing unmodified); MCP adds a transport only — no new outbound calls and no LLM (ADR-014 /
+  ADR-015 hold); two deployable manifestations from one core. Costs: a second binary to build,
+  configure, and ship, and an MCP transport library joins the stack (the exact crate is an open
+  question resolved at codegen).
+- **Alternatives considered.** MCP over **stdio** as a per-agent local subprocess (rejected — no OIDC
+  header; would require a new ambient/handshake identity model and weaken the multi-tenant posture; a
+  local stdio shim, if ever needed, is the broker's responsibility). MCP handlers **inside the existing
+  binary** alongside the HTTP handlers (rejected — does not deliver "separate binary / different
+  manifestations" and risks shared-process coupling). **Duplicating** the edge logic for MCP (rejected
+  — the exact divergence hazard this decision exists to prevent).
 
 ## Assumptions
 

@@ -1,6 +1,6 @@
 ### SPEC: Freshness Checker — RETIRED (superseded by ADR-014)
 
-> **Status:** Retired 2026-06-22 (RFC 01, ADR-014) · **derivedFromHld:** 0.6.0
+> **Status:** Retired 2026-06-22 (RFC 01, ADR-014) · **derivedFromHld:** 0.7.0
 
 This component is **removed**. ADR-013 placed a recall-side source-change check here; ADR-014 reverses
 that — the broker is a per-agent local component a central `recall` cannot reach, so freshness is the

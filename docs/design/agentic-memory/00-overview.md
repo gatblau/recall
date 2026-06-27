@@ -1,6 +1,6 @@
 # 00 — Overview
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 ## Summary
 
@@ -83,3 +83,6 @@ The full reasoning, the survey of existing systems, and the quality techniques a
 | Team | A group within a tenant that may share memory. | Acme's Platform team. |
 | Visibility | Whether a fact is private to its user, shared to a team, or shared across the tenant. | A team-shared runbook fact. |
 | Broker | The trusted component that authenticates as the user and calls `recall` on their behalf; co-located with the agent, it also reads source documents and checks their freshness (never `recall`'s job — ADR-014). | Injects the OIDC bearer token; re-reads a changed document for the agent. |
+| MCP (Model Context Protocol) | The protocol by which an AI agent discovers and calls tools. `recall` exposes its memory operations as MCP tools over streamable-HTTP from a second binary, carrying the same OIDC bearer as REST (ADR-016). | An agent's MCP client calling `recall`'s `recall` tool to query memory. |
+| Service Layer | The transport-agnostic core every operation runs through (auth → authorise → rate-limit → idempotency → component → audit → error-classification); both the REST and MCP edges are thin adapters over it (ADR-016). | `service.recall(ctx, req)` called identically by the HTTP and MCP edges. |
+| MCP API edge | The thin transport adapter (the `recall-mcp` binary) that exposes the service operations as MCP tools over streamable-HTTP (ADR-016). | The second of two edges over the one Service Layer; the first is the HTTP/REST edge. |

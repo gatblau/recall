@@ -1,7 +1,7 @@
 # Phase 3 — Detailed Component Specifications (index)
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
+> **derivedFromHld:** 0.7.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015), 2026-06-27 (RFC 01-MCP, ADR-016)
 
 Phase 3 exceeds the single-file threshold, so each component is one self-contained file under
 `docs/spec/components/`. Each follows the Phase 3 component template (Purpose, Approach, Shared

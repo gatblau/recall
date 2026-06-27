@@ -1,8 +1,29 @@
 ### SPEC: HTTP API Edge
-**File:** `src/api` | **Package:** `recall::api` | **Phase:** 5 | **Dependencies:** C1 (Memory Store), C2 (Durable Work Queue), C3 (Auth & Scope), C6 (Retrieval Engine)
+**File:** `src/api` | **Package:** `recall::api` | **Phase:** 6 | **Dependencies:** C9 (Service Layer)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.6.0
+> **derivedFromHld:** 0.7.0
+
+> **Change addendum (ADR-016, RFC 01) — HTTP edge becomes a thin adapter over C9.** The per-operation
+> orchestration this spec previously owned — **authenticate (step 3), authorise, rate-limit (step 4),
+> idempotency (step 5), the per-operation component dispatch (step 6's domain calls), the audit write
+> (step 8), and the `AppError`→`code` classification (step 7)** — has moved to the **Service Layer
+> (C9)** and is now defined there once and shared with the MCP edge (C10). This component **retains**
+> the HTTP-transport concerns: correlation-id assignment (step 1), body-size limiting (step 2), routing
+> and JSON (de)serialisation, bearer extraction from the `Authorization` header, conditional-GET
+> (`ETag`/`If-Modified-Since`) on `get_fact`, rendering the `Success`/`ErrorEnvelope` and the
+> `RateLimit-*`/`X-Correlation-Id`/`ETag` headers, mapping the registry `code` to the **HTTP status**,
+> the hand-built OpenAPI document, and the three operational endpoints (`/healthz`, `/readyz`,
+> `/metrics`). For each `/v1` operation the handler now: assigns a correlation id, enforces the body
+> limit, extracts the bearer, builds `CallContext{ bearer, correlation_id, idempotency_key }`, calls
+> the matching C9 `Service` method, and renders the `CallResult`/`AppError` to the HTTP response
+> (attaching `rate` as `RateLimit-*`). **The external REST contract — every path, status code,
+> envelope, header, and error code below — is unchanged**; this is a behaviour-preserving extraction,
+> proven by the existing BDD suite passing unmodified. Where the Internal Logic, Error Table, and
+> Acceptance Criteria below describe auth / authorise / rate / idempotency / audit / error-classification
+> behaviour, read them as the contract C8 now obtains from C9 — the canonical definition lives in
+> `service-layer.md`; this spec documents how the HTTP transport surfaces it. `build_state` is
+> unchanged and is shared with the `recall-mcp` binary (SA-BIN-01).
 
 #### Purpose
 

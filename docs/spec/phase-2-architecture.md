@@ -1,7 +1,7 @@
 # Phase 2 — Architecture Artefacts
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
+> **derivedFromHld:** 0.7.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015), 2026-06-27 (RFC 01-MCP, ADR-016)
 
 ## Table of contents
 
@@ -79,7 +79,17 @@ lower-numbered phases). `Complexity`: S/M/L/XL relative effort.
 | ~~C5~~ | ~~**Freshness Checker**~~ | — | — | — | **Retired by ADR-014** — freshness is agent-side; `recall` performs no source-change check. The id `C5` is retired (not reused) to keep C6/C7/C8 stable. |
 | C6 | **Retrieval Engine** (`src/retrieval`) | service-component | 4 | C1 | XL |
 | C7 | **Maintenance Worker** (`src/maintenance`) | service-component | 4 | C1, C2 | XL |
-| C8 | **HTTP API Edge** (`src/api`) | service-component | 5 | C1, C2, C3, C6 | L |
+| C9 | **Service Layer** (`src/service`) | service-component | 5 | C1, C2, C3, C6 | L |
+| C8 | **HTTP API Edge** (`src/api`) | service-component | 6 | C9 | M |
+| C10 | **MCP API Edge** (`src/mcp`, bin `recall-mcp`) | service-component | 6 | C9 | M |
+
+> **Change (ADR-016, RFC 01).** C9 is **new**: the transport-agnostic orchestration extracted from the
+> former C8 (`EdgePipeline`) — auth → authorise → rate-limit → idempotency → component → audit → X1
+> error-classification, keyed on a verified `ScopeContext` and the 2C DTOs (SA-SVC-01). C8 is
+> **refactored** from "owns orchestration" to a thin HTTP adapter over C9 (its external contract is
+> byte-for-byte preserved). C10 is **new**: a second thin adapter exposing the same operations as MCP
+> tools over streamable-HTTP, in its own binary `recall-mcp` (SA-BIN-01, SA-MCP-TRANSPORT-01). Both
+> edges build from the same `build_state`.
 
 **Dependency DAG (build order):**
 
@@ -89,14 +99,17 @@ C1 Memory Store
  │                  ├─> C4 Write Pipeline
  │                  └─> C7 Maintenance
  ├──────────────────────────────────────> C6 Retrieval ─┐
- └──────────────────────────────────────> C8 (store)    │
-C3 Auth & Scope ─────────────────────────────────────> C8 HTTP API Edge
+ └───────────────────────────────────────────────────┐  │
+C3 Auth & Scope ──────────────────────────────────┐  │  │
+                                                   ▼  ▼  ▼
+                                              C9 Service Layer ─┬─> C8 HTTP API Edge (bin recall)
+                                                                └─> C10 MCP API Edge (bin recall-mcp)
 ```
 
 No cycles: every edge points from a lower phase to a higher one. C6 Retrieval depends only on C1
-(C5 Freshness Checker is retired — ADR-014). The HTTP API Edge (C8) reaches the Write Pipeline only
+(C5 Freshness Checker is retired — ADR-014). The Service Layer (C9) reaches the Write Pipeline only
 indirectly, by enqueuing on C2 — the write path is asynchronous (ADR-004), so there is no synchronous
-C8→C4 edge.
+C9→C4 edge. Both edges (C8, C10) depend only on C9; they share no code beyond it (SA-SVC-01).
 
 **External provider adapters** (`EmbeddingClient`, `RerankClient`,
 `PiiDetector`) are not separate components — they are trait abstractions defined in 2C and injected
@@ -569,6 +582,14 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_QUEUE_REAPER_SECS` | u32 | `30` | no | C2 | Lease-reaper sweep cadence; expired leases revert to Pending (SA-QUEUE-02). |
 | `RECALL_QUEUE_POLL_MS` | u32 | `500` | no | C2 | Worker empty-claim poll interval (back-off between idle claims). |
 | `RECALL_REFORMULATION_ENABLED` | bool | `false` | no | C6 | A/B query-reformulation flag; off by default (good-mem §7.3, ADR-012). |
+| `RECALL_MCP_HTTP_ADDR` | socket addr | `0.0.0.0:8081` | no | C10 | Bind address for the MCP streamable-HTTP listener (the `recall-mcp` binary; SA-MCP-TRANSPORT-01). |
+| `RECALL_MCP_PATH` | path | `/mcp` | no | C10 | HTTP path the MCP endpoint is served at on the `recall-mcp` binary. |
+
+> **Owner reassignment (ADR-016).** `RECALL_IDEMPOTENCY_TTL_SECS`, `RECALL_RATE_READ_PER_MIN`, and
+> `RECALL_RATE_WRITE_PER_MIN` move from owner **C8 → C9** — idempotency and rate limiting are now
+> Service-Layer concerns applied uniformly to both edges (SA-SVC-01). `RECALL_MAX_BODY_BYTES` stays an
+> HTTP-transport concern and applies to both edge binaries (C8 and C10). All other variables are
+> unchanged; both binaries read the same configuration model (SA-BIN-01).
 | `RECALL_EMBED_MODEL_VERSION` | string | `default` | no | C4/C6/C7 | Active embedding-model version tag; the C7 re-embed scan keys on it (SA-EMBED-01). |
 | `RECALL_MAINT_BATCH_SIZE` | u32 | `500` | no | C7 | Per-duty maintenance scan bound; keeps a cycle off the read-path store budget. |
 | `RECALL_REINFORCE_GAIN` | f64 | `0.5` | no | C7 | Stability gain `Δs` applied on recall/reinforcement (SA-DECAY-01). |

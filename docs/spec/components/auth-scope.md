@@ -3,7 +3,7 @@
 **File:** `src/auth` | **Package:** `recall::auth` | **Phase:** 2 | **Dependencies:** none (shared types only — `ScopeRef`, `ScopeContext`, `OpSet`, `Visibility`, `AppError`)
 
 > **Mode:** greenfield
-> **derivedFromHld:** 0.6.0
+> **derivedFromHld:** 0.7.0
 
 #### Purpose
 

@@ -1,6 +1,6 @@
 # 01 — System Context
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 `recall` is a network service called by the broker on behalf of an end user, backed by a
 memory store and assisted by external model providers for the asynchronous write/maintenance path.
@@ -33,9 +33,11 @@ flowchart TB
   responses as untrusted data.
 - **Broker** — the trusted caller, co-located with the agent. Authenticates as the end user,
   injects an OIDC bearer token, enforces the system allowlist and broker-side audit, and reads source
-  documents / checks their freshness on the agent's behalf. **Interaction:** HTTPS to `recall`'s API;
-  `Authorization: Bearer <OIDC JWT>`; direction broker→`recall` only — `recall` makes **no** outbound
-  call to the broker (ADR-014, superseding the ADR-013 re-entrant check).
+  documents / checks their freshness on the agent's behalf. **Interaction:** to `recall`'s API over
+  either of its two edges — the **REST** API or the **MCP** API (both networked, both over the same
+  `Authorization: Bearer <OIDC JWT>`; ADR-016); direction broker→`recall` only — `recall` makes **no**
+  outbound call to the broker (ADR-014, superseding the ADR-013 re-entrant check). The MCP edge is the
+  agent's native tool interface and adds no new trust boundary — it authenticates identically to REST.
 - **OIDC Identity Provider** — issues and signs the bearer tokens the broker carries, and exposes
   discovery + JWKS endpoints `recall` uses to validate them. **Interaction:** the broker obtains
   tokens; `recall` fetches `.well-known/openid-configuration` and the JWKS over HTTPS. IdP is

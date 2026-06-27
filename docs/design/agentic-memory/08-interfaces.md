@@ -1,6 +1,6 @@
 # 08 — External Interfaces
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 Names and shapes only. Exact JSON schemas, field types, error codes, and status-code tables belong in
 `/spec`. All endpoints are **new**. All require an OIDC bearer token except the unauthenticated
@@ -25,6 +25,27 @@ operational endpoints noted.
 | Liveness | `GET /healthz` | Process is up. |
 | Readiness | `GET /readyz` | Store and OIDC discovery reachable. |
 | Metrics | `GET /metrics` | Observability scrape endpoint (no fact content). |
+
+## MCP interface (second edge — ADR-016)
+
+The same operations are also exposed over **MCP (Model Context Protocol)** from a separate binary
+(`recall-mcp`), as a second manifestation of the one service. Names and shapes only; detail in `/spec`.
+
+| MCP surface | Shape | Maps to |
+|---|---|---|
+| Tool discovery | `tools/list` | The MCP analogue of `GET /v1` + `/openapi.json` — advertises the tools below with machine-readable input schemas generated from the same types that back the OpenAPI document. |
+| `recall` tool | `tools/call` name `recall` | `POST /v1/recall` — hybrid retrieval; same request fields incl. `include_provenance`. |
+| `remember` tool | `tools/call` name `remember` | `POST /v1/memories` — async-accepted; the tool result carries the same idempotent acknowledgement. |
+| `get` tool | `tools/call` name `get` | `GET /v1/memories/{id}`. |
+| `retire` tool | `tools/call` name `retire` | `POST /v1/memories/{id}/retire`. |
+| `delete` tool | `tools/call` name `delete` | `DELETE /v1/memories/{id}` — verifiable hard delete, proof returned (unchanged). |
+
+- **Transport:** MCP over **streamable-HTTP** (networked), not stdio.
+- **Auth:** the same `Authorization: Bearer <OIDC JWT>` the broker injects for REST; the Service Layer
+  derives the `ScopeContext` identically (ADR-016). A call without a valid bearer is rejected with the
+  same error class as the equivalent unauthenticated REST call.
+- **Errors:** the one error-code registry is rendered as MCP tool/protocol errors (the same `code`s the
+  REST edge maps to HTTP statuses).
 
 ## Outbound interfaces
 

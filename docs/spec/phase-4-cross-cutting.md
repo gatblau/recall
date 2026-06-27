@@ -1,7 +1,15 @@
 # Phase 4 — Cross-Cutting Concern Specifications
 
 > **Spec set:** `recall` (agentic memory service) · **Mode:** greenfield
-> **derivedFromHld:** 0.6.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015)
+> **derivedFromHld:** 0.7.0 · **Source HLD:** `docs/design/agentic-memory/` · **Authored:** 2026-06-20 · **Amended:** 2026-06-22 (RFC 01, ADR-014; RFC 02, ADR-015), 2026-06-27 (RFC 01-MCP, ADR-016)
+
+> **Amendment (ADR-016, RFC 01-MCP).** The cross-cutting **policies** below — X1 error registry, X2
+> authentication & authorisation, rate limiting, audit, X3/X4/X5 observability — are **unchanged in
+> substance**. What changes is their **enforcement locus**: they are now applied once in the **Service
+> Layer (C9)** and shared by both transport edges (C8 HTTP, C10 MCP), rather than inside the HTTP edge.
+> Read every "the edge enforces…" clause below as "the Service Layer enforces…, surfaced by whichever
+> edge received the call". The error `code` registry (X1) is the single classification source both
+> edges render from (HTTP status vs MCP error). No new cross-cutting concern is introduced.
 
 Each concern below is a first-class component spec applying the Phase 3 template. These specs sit at
 **Phase 0** of the build order — foundational libraries/middleware consumed by the eight Phase 1–5
@@ -35,7 +43,7 @@ table draws its `code` values from it.
 
 **File:** `src/error.rs`, `src/api/envelope.rs` | **Package:** `recall::error` | **Phase:** 0 | **Dependencies:** §2C.1, §2C.7
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Defines the one success envelope, the one error envelope, the closed error-code registry, the
@@ -147,7 +155,7 @@ None.
 
 **File:** `src/auth` (mechanism) + `src/api/middleware/auth.rs` | **Package:** `recall::auth` | **Phase:** 0 | **Dependencies:** C3, §2C.3
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 States the system-wide authn/authz policy that every authenticated endpoint enforces (ADR-001,
@@ -219,7 +227,7 @@ None.
 
 **File:** `src/obs/log.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Structured operational logging with correlation-id propagation and strict redaction — for debugging
@@ -287,7 +295,7 @@ None.
 
 **File:** `src/obs/metrics.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 The four quality layers from `good-mem.md` §13 (HLD 07 "Metrics"): task usage, memory quality,
@@ -351,7 +359,7 @@ None.
 
 **File:** `src/obs/trace.rs` | **Package:** `recall::obs` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Distributed tracing across the API edge, the read path, and the async workers so a request can be
@@ -415,7 +423,7 @@ None.
 
 **File:** `src/config.rs` | **Package:** `recall::config` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Load, validate, and freeze all configuration at startup with precedence **env var > config file >
@@ -494,7 +502,7 @@ None.
 
 **File:** `src/store/migrate.rs`, `migrations/*.surql` | **Package:** `recall::store` | **Phase:** 0 | **Dependencies:** C1, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Evolve the per-tenant SurrealDB schema through numbered, ordered, reversible migrations; dry-run before
@@ -582,7 +590,7 @@ None.
 
 **File:** `src/api/health.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C1, C3, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Liveness and readiness endpoints so an orchestrator can route traffic only to a healthy instance (HLD
@@ -653,7 +661,7 @@ None.
 
 **File:** `src/api/middleware/ratelimit.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C3, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Agent-aware rate limiting with standard headers (HLD 07 "Rate limiting"; SA-RATE-01) — agents emit far
@@ -721,7 +729,7 @@ None.
 
 **File:** `src/api/pagination.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** C6, §2C.1, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Bounded, capped, token-efficient, stably-ordered result pages (HLD 07 "Pagination"; SA-PAGE-01,
@@ -789,7 +797,7 @@ None.
 
 **File:** `src/api/middleware/cors.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 HLD 07 records CORS as **Does not apply (default)** — callers are server-side (the broker), not
@@ -857,7 +865,7 @@ None.
 
 **File:** `src/api/validate.rs` | **Package:** `recall::api` | **Phase:** 0 | **Dependencies:** §2C, §2D
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 Validate at every API boundary, bound request size, and reject malformed input with the standard error
@@ -927,7 +935,7 @@ None.
 
 **File:** `src/shutdown.rs` | **Package:** `recall` | **Phase:** 0 | **Dependencies:** C2, C4, C6, C7, C8
 
-> **Mode:** greenfield · **derivedFromHld:** 0.6.0
+> **Mode:** greenfield · **derivedFromHld:** 0.7.0
 
 #### Purpose
 On SIGTERM/SIGINT, drain in-flight requests, finish or re-enqueue in-flight async jobs, and close the

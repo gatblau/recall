@@ -1,6 +1,6 @@
 # 03 — Principal Sequences
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 Logical order-of-operations for the four principal flows. Payload detail is deferred to `/spec`.
 

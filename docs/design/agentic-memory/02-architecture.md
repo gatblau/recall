@@ -1,6 +1,6 @@
 # 02 — System Architecture
 
-> **Mode:** draft · **Revision:** 0.6.0 · **Last updated:** 2026-06-22
+> **Mode:** draft · **Revision:** 0.7.0 · **Last updated:** 2026-06-27
 
 `recall` is internally split along one principal seam: a **fast synchronous read path** and a **slow
 asynchronous write/maintenance path**, sharing one hybrid store. This seam is the central
@@ -39,11 +39,22 @@ flowchart TB
 
 ### Component responsibilities
 
-- **HTTP API edge** — terminates HTTPS, exposes the small set of task-shaped endpoints (recall /
-  remember / forget / freshness-check / capabilities), serves the OpenAPI contract, applies
-  agent-aware rate limiting, enforces the consistent success/error envelope, and writes the per-call
-  **append-only audit record** (subject, operation, scope, outcome, token `jti`) — see Cross-cutting →
-  Audit for where it is stored. Owns: the external contract and audit emission. Depends on: Auth & Scope.
+- **Service Layer** — the **transport-agnostic core** (ADR-016) every operation runs through: it
+  authenticates the bearer to a `ScopeContext` (via Auth & Scope), authorises the operation class,
+  applies rate limiting and idempotency, invokes the owning component, writes the per-call append-only
+  audit record, and classifies any failure to a single error `code`. It is keyed on a verified
+  `ScopeContext` and transport-neutral request/response types, and returns a typed result or a typed
+  error — it knows nothing of HTTP or MCP. Owns: orchestration and governance enforcement.
+  Depends on: Auth & Scope, Memory Store, Durable work queue, Retrieval Engine.
+- **HTTP API edge** — a **thin transport adapter** (ADR-016) over the Service Layer: terminates HTTPS,
+  exposes the small set of task-shaped endpoints (recall / remember / forget / get / capabilities),
+  serves the OpenAPI contract, maps the REST wire format (headers / JSON / status codes / envelopes) to
+  and from the Service Layer, and renders error `code`s as HTTP statuses. Its external contract is
+  unchanged by the extraction. Owns: the REST contract. Depends on: Service Layer.
+- **MCP API edge** — a second **thin transport adapter** (ADR-016), shipped as a separate binary
+  (`recall-mcp`): exposes the same service operations as **MCP tools over streamable-HTTP**, advertises
+  them via native tool discovery, carries the same broker-injected OIDC bearer as REST, and renders
+  error `code`s as MCP tool/protocol errors. Owns: the MCP contract. Depends on: Service Layer.
 - **Auth & Scope** — validates the OIDC bearer token (signature via JWKS, issuer, audience, expiry),
   derives the caller identity from a token claim, maps it to the owning memory scope, and enforces
   per-operation authorisation. Every downstream operation is scoped here; nothing trusts a
