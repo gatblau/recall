@@ -267,6 +267,19 @@ impl Service {
                     .await
             }
         };
+        // Chain step 5 — `content` must be a structured assertion object: recall holds no LLM and runs
+        // no extraction (ADR-015), so a non-object `content` is a client error, not something to wrap.
+        if !req.content.is_object() {
+            return self
+                .finish_error(
+                    pipe,
+                    AppError::Validation(
+                        ValidationKind::InvalidBody,
+                        "remember content must be a JSON object".into(),
+                    ),
+                )
+                .await;
+        }
 
         // Build and enqueue an ExtractFact WorkJob; the as-built handler sets every field.
         let payload = remember_payload(&req);

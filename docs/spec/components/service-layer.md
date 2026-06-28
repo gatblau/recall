@@ -94,13 +94,24 @@ pub struct CallResult<T> {
     pub replayed: bool,            // true on an idempotent replay (writes)
 }
 
+/// Typed error: an `AppError` (classified to one registry `code`) plus the rate snapshot that must
+/// still reach the edge on a 429 / post-auth error so it can attach `RateLimit-*`. `rate` is `None` on
+/// an auth/authorise failure (401/403), where no rate-limit headers are attached.
+pub struct CallError {
+    pub error: AppError,
+    pub rate: Option<RateSnapshot>,
+}
+
 impl Service {
-    pub async fn capabilities(&self, cx: CallContext<'_>) -> Result<CallResult<Capabilities>, AppError>;
-    pub async fn recall(&self, cx: CallContext<'_>, req: RecallRequest) -> Result<CallResult<RecallOutcome>, AppError>;
-    pub async fn remember(&self, cx: CallContext<'_>, req: RememberRequest) -> Result<CallResult<WriteAck>, AppError>;
-    pub async fn get_fact(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<Fact>, AppError>;
-    pub async fn retire(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<RetireAck>, AppError>;
-    pub async fn delete(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<DeletionProof>, AppError>;
+    pub async fn capabilities(&self, cx: CallContext<'_>) -> Result<CallResult<Capabilities>, CallError>;
+    // recall/remember take the raw request body and deserialise it INTERNALLY, so the chain
+    // (auth → authorise → rate-limit, and for writes idempotency replay) runs BEFORE body parsing —
+    // preserving the precedence where a malformed body on an unauthenticated request is a 401, not a 400.
+    pub async fn recall(&self, cx: CallContext<'_>, body: &[u8]) -> Result<CallResult<RecallOutcome>, CallError>;
+    pub async fn remember(&self, cx: CallContext<'_>, body: &[u8]) -> Result<CallResult<WriteAck>, CallError>;
+    pub async fn get_fact(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<Fact>, CallError>;
+    pub async fn retire(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<RetireAck>, CallError>;
+    pub async fn delete(&self, cx: CallContext<'_>, id: &str) -> Result<CallResult<DeletionProof>, CallError>;
 }
 ```
 
@@ -108,7 +119,7 @@ Operation classes: `recall`/`get_fact`/`capabilities` → `Op::Read`/`OpClass::R
 
 ##### Example
 
-`service.remember(CallContext{ bearer:"eyJ…", correlation_id:"9b1d…", idempotency_key:Some("k-001") }, RememberRequest{ content: {"subject":"Team Alpha","predicate":"owns","object":"orders table"}, source:None, memory_class:None })` → on first call `Ok(CallResult{ data: WriteAck{ job_id:"work_job:018f…", status: Accepted }, rate: {limit:30,remaining:29,reset_secs:2}, replayed:false })`; on a replay within 24 h `Ok(CallResult{ data: WriteAck{ job_id:"work_job:018f…", status: AlreadyAccepted }, replayed:true, .. })` with no new job enqueued.
+`service.remember(CallContext{ bearer:"eyJ…", correlation_id:"9b1d…", idempotency_key:Some("k-001") }, br#"{"content":{"subject":"Team Alpha","predicate":"owns","object":"orders table"}}"#)` (the body is the raw `RememberRequest` JSON bytes) → on first call `Ok(CallResult{ data: WriteAck{ job_id:"work_job:018f…", status: Accepted }, rate: {limit:30,remaining:29,reset_secs:2}, replayed:false })`; on a replay within 24 h `Ok(CallResult{ data: WriteAck{ job_id:"work_job:018f…", status: AlreadyAccepted }, replayed:true, .. })` with no new job enqueued. A non-object `content` is `Err(CallError{ error: Validation(InvalidBody, …), .. })` (step 5).
 
 #### Internal Logic
 

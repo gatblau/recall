@@ -871,3 +871,27 @@ async fn mcp_recall_is_tenant_isolated() {
         "a globex recall must NOT see acme's fact (cross-tenant isolation), got {facts:?}"
     );
 }
+
+#[tokio::test]
+async fn mcp_remember_non_object_content_is_rejected() {
+    // FU-004: the C9 spec requires `remember.content` to be a structured assertion object; a
+    // well-formed but non-object content (here a bare string) is a VAL_INVALID_BODY client error,
+    // not something to enqueue. The guard lives in the shared Service, so this proves it for both edges.
+    let harness = build_mcp_harness(8).await;
+    let token = harness.mint("u-sarah", "acme", "alpha", "memory.read memory.write");
+
+    let params = json!({
+        "name": "remember",
+        "arguments": { "content": "just a string, not an object", "idempotency_key": "k-nonobj-001" }
+    });
+    let resp = call(&harness, &rpc("tools/call", params, 60), Some(&token)).await;
+
+    let code = resp
+        .pointer("/error/data/code")
+        .and_then(|c| c.as_str())
+        .expect("a non-object content must be an MCP error carrying the registry code");
+    assert_eq!(
+        code, "VAL_INVALID_BODY",
+        "a non-object remember.content must map to VAL_INVALID_BODY (C9 spec step 5)"
+    );
+}

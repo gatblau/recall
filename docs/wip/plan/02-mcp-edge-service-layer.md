@@ -101,14 +101,16 @@ Final black-box gate (the gate `/sync-check` relies on): `cargo build` (both bin
   why: surfaced in apply-phase-1. The C9 spec (components/service-layer.md Internal Logic step 5) says reject a non-object `remember.content` with VAL_INVALID_BODY, but the original C8 handler never enforced this, so the extraction omitted it to stay strictly behaviour-preserving. Either add the check (+ a test) in a later phase or reconcile the spec to match the as-built behaviour (a non-object content currently enqueues). A latent CONTRACT-DRIFT that /sync-check will flag.
   source: apply-phase-1
   suggested-command: /sync-check then /apply or /sync-spec for components/service-layer.md
-  status: open
+  status: done
+  resolution: 2026-06-28 — tightened the CODE to the spec. `Service::remember` now rejects a non-object `content` with VAL_INVALID_BODY (src/service/mod.rs, after body deserialisation); covered by tests/mcp.rs::mcp_remember_non_object_content_is_rejected. The spec was already correct.
   added: 2026-06-27
 - id: FU-005
   title: Confirm the body-bytes signature of Service::{recall,remember} fits the MCP edge cleanly
   why: surfaced in apply-phase-1. To preserve the original auth-before-parse ordering, Service::recall/remember take the raw body `&[u8]` and deserialise internally (rather than the spec's typed `req` param). The MCP edge (Phase 2) gets tool args as JSON; it must serialise them to bytes to call these methods. Works (auth-before-parse preserved) but verify it reads cleanly when C10 lands; reconcile the C9 spec signature note if needed.
   source: apply-phase-1
   suggested-command: revisit during /apply phase 2
-  status: open
+  status: done
+  resolution: 2026-06-28 — confirmed clean (the MCP edge serialises tool args to bytes; auth-before-parse preserved on both edges). Reconciled the C9 spec (SPEC side, /sync-spec) to the as-built: Public Interface now shows `recall/remember(cx, body: &[u8])`, the `CallError` wrapper, and `Result<CallResult<T>, CallError>` for all six methods.
   added: 2026-06-27
 ```
 
