@@ -76,7 +76,8 @@
 - id: FU-019
   title: Wire remote SurrealDB credentials (signin) for secured endpoints
   why: FU-009 unified the connection on `engine::any`, but `Store::connect` does not call `signin(Root{...})` and `Config` has no remote-credential fields — a *secured* remote server cannot authenticate (a no-auth endpoint works today). Add `RECALL_STORE_REMOTE_USER`/`RECALL_STORE_REMOTE_PASS` (Secret) config + a `signin` after `connect` when set, and a `use_ns`/`use_db` root-scope check. Deployment-blocking only for secured remote stores; embedded default unaffected.
-  status: open
+  status: scheduled
+  scheduled-in: docs/wip/plan/04-remote-store-signin.md
   added: 2026-06-21
 
 # --- from the ADR-014 (agent-side freshness) plan ---
