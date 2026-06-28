@@ -1,0 +1,21 @@
+# Keep the build context lean. The release build needs only the crate manifests, the
+# source tree, and the migrations directory.
+
+target/
+.git/
+docs/
+tests/
+.github/
+
+# Editor / IDE / OS cruft.
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Project assets and notes not needed to compile.
+*.png
+README.md
+CLAUDE.md
+.claude/
