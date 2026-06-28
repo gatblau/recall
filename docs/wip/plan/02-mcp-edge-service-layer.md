@@ -80,7 +80,8 @@ Final black-box gate (the gate `/sync-check` relies on): `cargo build` (both bin
   why: ADR-016 ships a second binary; building it is in scope, distributing it (image, compose/helm wiring, release notes) is a deployment concern out of this plan.
   source: planning
   suggested-command: /breakdown FU-001 from docs/wip/plan/02-mcp-edge-service-layer.md
-  status: open
+  status: scheduled
+  scheduled-in: docs/wip/plan/03-container-packaging-release.md
   added: 2026-06-27
 - id: FU-002
   title: Pin the production MCP client/transport configuration (OQ-LIB outcome) in deployment docs
