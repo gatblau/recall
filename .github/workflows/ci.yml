@@ -1,0 +1,45 @@
+# Continuous integration (plan 03 phase 3).
+#
+# Runs on every push to main and every pull request, so the release path is never the first place the
+# tests run. Build + lint + the unit, MCP, and BDD suites. The heavy container-image smoke
+# (`cargo test --test container`, a full Rust-in-Docker build) is reserved for the release workflow.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Lint (clippy, warnings as errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests (lib)
+        run: cargo test --lib --locked
+
+      - name: MCP edge + parity suite
+        run: cargo test --test mcp --locked
+
+      # The BDD suite brings up a real dexidp/dex container; ubuntu-latest ships Docker.
+      - name: BDD suite (outside-in, real Dex)
+        run: cargo test --test bdd --locked
