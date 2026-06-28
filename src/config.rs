@@ -97,6 +97,9 @@ impl std::fmt::Display for Secret {
 pub struct Config {
     // --- C8 HTTP ---
     pub http_addr: SocketAddr,
+    // --- C10 MCP edge ---
+    pub mcp_http_addr: SocketAddr,
+    pub mcp_path: String,
     // --- C1 store ---
     pub store_path: String,
     pub store_remote_url: Option<String>,
@@ -239,6 +242,11 @@ impl Config {
         // --- C8 HTTP ---
         let http_addr_raw = src.get_or("RECALL_HTTP_ADDR", "0.0.0.0:8080");
         let http_addr: SocketAddr = parse_field("RECALL_HTTP_ADDR", &http_addr_raw)?;
+
+        // --- C10 MCP edge ---
+        let mcp_http_addr_raw = src.get_or("RECALL_MCP_HTTP_ADDR", "0.0.0.0:8081");
+        let mcp_http_addr: SocketAddr = parse_field("RECALL_MCP_HTTP_ADDR", &mcp_http_addr_raw)?;
+        let mcp_path = src.get_or("RECALL_MCP_PATH", "/mcp");
 
         // --- C1 store ---
         let store_path = src.get_or("RECALL_STORE_PATH", "./data/recall.db");
@@ -388,6 +396,8 @@ impl Config {
 
         Ok(Config {
             http_addr,
+            mcp_http_addr,
+            mcp_path,
             store_path,
             store_remote_url,
             store_backend,

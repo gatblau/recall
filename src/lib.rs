@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod maintenance;
+pub mod mcp;
 pub mod obs;
 pub mod providers;
 pub mod queue;
