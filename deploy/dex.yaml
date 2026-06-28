@@ -1,0 +1,31 @@
+# Dex OIDC issuer for the local docker-compose stack (Phase 2, plan 03).
+#
+# Mirrors the YAML shape minted by `tests/support/dex.rs` `dex_config`: in-memory storage, the
+# password connector (ROPC), one static client and one static user. The only difference is the
+# issuer URL — here it is the in-network service name `http://dex:5556/dex` so that BOTH edges
+# resolve discovery over the compose network AND the `iss` claim of a Dex-minted token validates
+# against what `recall`/`recall-mcp` were configured with (RECALL_OIDC_ISSUER).
+#
+# SECURITY NOTE: the client secret and the bcrypt password hash below are TEST FIXTURES copied
+# verbatim from tests/support/dex.rs (DEX_CLIENT_SECRET + the bcrypt hash for "password123").
+# They authenticate a throwaway local IdP only and are not credentials for any real system.
+issuer: http://dex:5556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  passwordConnector: local
+  skipApprovalScreen: true
+enablePasswordDB: true
+staticPasswords:
+  - email: "tester@example.com"
+    hash: "$2y$10$IcAwXtH3RsRsQlnPSfThfuQ7ghbofQERhhYolr/WRXlCxmswGvzTW"
+    username: "tester"
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+staticClients:
+  - id: recall-test
+    secret: recall-test-secret
+    name: "Recall Test"
+    redirectURIs:
+      - "http://127.0.0.1/callback"

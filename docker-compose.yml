@@ -1,0 +1,99 @@
+# Local deployment wiring for recall's two edges (Phase 2, plan 03 — FU-001).
+#
+# Brings up BOTH externally-reachable surfaces of recall from the ONE image built in Phase 1:
+#   - `recall`     — the REST API edge   (port 8080)
+#   - `recall-mcp` — the MCP edge        (port 8081)
+# selected purely by the container command. They are "two manifestations of one service".
+#
+# TOPOLOGY — why a shared REMOTE store, not two embedded ones:
+#   recall's embedded SurrealKV store writes to a local file; two containers cannot share one file,
+#   so two embedded stores would give the edges DISJOINT memory (a `remember` over REST would be
+#   invisible over MCP). To make them genuinely one service they must share ONE store, so this stack
+#   runs a single SurrealDB server and points both edges at it via `RECALL_STORE_REMOTE_URL`
+#   (`ws://...`). `Store::connect` resolves the `ws://` scheme to the remote engine (src/store/mod.rs),
+#   so the edges open the SAME database.
+#
+#   The SurrealDB server runs UNAUTHENTICATED. recall's `Store::connect` does NOT sign in to the
+#   remote (the FU-019 gap — see docs/runbooks/recall-containers.md), so a secured server would
+#   reject its DDL/DML. An unauthenticated server grants full access and is what works today. This is
+#   acceptable for a local single-node stack on a private compose network; it is NOT a production
+#   posture. Securing the remote store is tracked as FU-019 (remote signin).
+#
+# BOOT ORDERING — recall fail-fasts with NO retry:
+#   `build_state` constructs the C3 Authenticator (OIDC discovery + JWKS fetch) and opens the store,
+#   and exits non-zero if either the OIDC issuer OR the store is unreachable — there is no internal
+#   retry. The edges may therefore start before Dex/SurrealDB are ready. `depends_on` only orders
+#   start, it does not wait for readiness, so each edge carries `restart: on-failure`: it dies fast
+#   if a dependency is not yet up and compose restarts it until boot succeeds. (Healthcheck-gated
+#   `condition: service_healthy` is an alternative but the Dex image ships no curl/wget; the
+#   restart-loop is the robust choice.)
+#
+# IMAGE: this stack references the locally-built `recall:ci` (Phase 1: `docker build -t recall:ci .`).
+# A published release would instead reference `ghcr.io/gatblau/recall:<tag>` (Phase 3).
+
+services:
+  # --- OIDC issuer (local) -----------------------------------------------------
+  dex:
+    image: dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./deploy/dex.yaml:/etc/dex/config.yaml:ro
+    ports:
+      # Host access so an operator can mint a token (ROPC) for manual REST/MCP calls.
+      - "35357:5556"
+
+  # --- Shared store (UNAUTHENTICATED — see topology note above) ----------------
+  surrealdb:
+    image: surrealdb/surrealdb:v3.1.5
+    # No --user/--pass: the server starts unauthenticated (full access), which is what recall's
+    # no-signin Store::connect requires today (FU-019). `memory` keeps the store ephemeral — a fresh
+    # store every `up`; swap to a surrealkv:// path + a named volume for persistence if needed.
+    command: ["start", "--bind", "0.0.0.0:8000", "memory"]
+    ports:
+      - "8000:8000"
+
+  # --- REST edge ---------------------------------------------------------------
+  recall:
+    image: recall:ci   # release: ghcr.io/gatblau/recall:<tag>
+    command: ["recall"]
+    ports:
+      - "8080:8080"
+    environment:
+      # OIDC: the in-network Dex name, so the edge resolves discovery AND the token `iss` validates.
+      RECALL_OIDC_ISSUER: "http://dex:5556/dex"
+      RECALL_OIDC_AUDIENCE: "recall-test"
+      # Shared remote store — BOTH edges point here so they share one database.
+      RECALL_STORE_REMOTE_URL: "ws://surrealdb:8000"
+      # Embedding / reranker providers are OPERATOR-SUPPLIED. The placeholders below let the edge
+      # boot and serve discovery/health, but recall/remember will not fully work until real provider
+      # endpoints (and their API keys) are set. Replace these with your real provider URLs + keys.
+      RECALL_EMBED_URL: "http://embed.invalid"
+      RECALL_EMBED_API_KEY: "placeholder-embed-key"
+      RECALL_RERANK_URL: "http://rerank.invalid"
+      RECALL_RERANK_API_KEY: "placeholder-rerank-key"
+      # Must match the embedding model's output dimension once a real provider is wired.
+      RECALL_EMBED_DIM: "1024"
+    depends_on:
+      - dex
+      - surrealdb
+    restart: on-failure
+
+  # --- MCP edge ----------------------------------------------------------------
+  recall-mcp:
+    image: recall:ci   # release: ghcr.io/gatblau/recall:<tag>
+    command: ["recall-mcp"]
+    ports:
+      - "8081:8081"
+    environment:
+      RECALL_OIDC_ISSUER: "http://dex:5556/dex"
+      RECALL_OIDC_AUDIENCE: "recall-test"
+      RECALL_STORE_REMOTE_URL: "ws://surrealdb:8000"
+      RECALL_EMBED_URL: "http://embed.invalid"
+      RECALL_EMBED_API_KEY: "placeholder-embed-key"
+      RECALL_RERANK_URL: "http://rerank.invalid"
+      RECALL_RERANK_API_KEY: "placeholder-rerank-key"
+      RECALL_EMBED_DIM: "1024"
+    depends_on:
+      - dex
+      - surrealdb
+    restart: on-failure
