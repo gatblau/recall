@@ -184,6 +184,15 @@ fn registry(e: &AppError) -> (StatusCode, &'static str, &'static str) {
     }
 }
 
+impl AppError {
+    /// The closed-registry machine `code` for this error (SCREAMING_SNAKE_CASE), independent of the
+    /// correlation id and deployment env. Used by the Service Layer to record an error outcome on the
+    /// audit trail without minting an envelope.
+    pub fn code(&self) -> &'static str {
+        registry(self).1
+    }
+}
+
 /// Map an [`AppError`] to its HTTP status and the closed-registry error envelope.
 ///
 /// In `production` the message is the fixed human string per code; in `development` the inner

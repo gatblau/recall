@@ -1,11 +1,15 @@
-//! C8 — the `/v1` task handlers plus `GET /openapi.json`.
+//! C8 — the `/v1` task handlers plus `GET /openapi.json`, now thin HTTP adapters over the Service
+//! Layer (C9, ADR-016).
 //!
-//! Each handler is thin. The cross-cutting concerns run in the fixed order mandated by the C8 chain —
-//! auth (C3) → rate limit → idempotency (writes only) → handler body → audit — via [`EdgePipeline`].
-//! `EdgePipeline::begin` performs auth + per-operation-class authorisation + rate limiting and returns
-//! the authenticated [`ScopeContext`] and the rate-limit headers; the handler then runs its body; and
-//! the handler finishes by calling `finish_success` / `finish_error`, which writes the audit record
-//! before the response is returned (chain step 8). Operational routes do not use this module.
+//! Each handler does only HTTP-transport work: it reads the correlation id, extracts the bearer from
+//! the `Authorization` header, reads the `Idempotency-Key` header (writes), passes the raw body / path
+//! param, builds a [`CallContext`], calls the matching [`Service`] method, and renders the returned
+//! [`CallResult`] (success envelope + `RateLimit-*`/`X-Correlation-Id`/`ETag` headers) or [`CallError`]
+//! (the X1 error envelope + status). The security-critical chain — authenticate, authorise,
+//! rate-limit, idempotency, the component call, and the audit write — lives once in C9 and is shared
+//! with the MCP edge. Conditional-GET (`ETag`/`If-Modified-Since`) on `get_fact` stays here: it is an
+//! HTTP optimisation the edge layers over the Service's full-`Fact` read. Operational routes do not use
+//! this module.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -13,169 +17,23 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use http::header::{
-    CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER,
-};
+use http::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, RETRY_AFTER};
 use http::{HeaderName, HeaderValue, StatusCode};
 use serde::Serialize;
-use serde_json::Value;
 use uuid::Uuid;
 
-use crate::api::ratelimit::{OpClass, RateHeaders, TokenBucket, READ_BURST, WRITE_BURST};
 use crate::api::{error_response, AppState, CorrelationId, CORRELATION_ID_HEADER};
-use crate::auth::{Authenticator, Op};
-use crate::error::{AppError, AuthKind, ValidationKind};
-use crate::types::api::{
-    Capabilities, JobAckStatus, RecallRequest, RememberRequest, RetireAck, WriteAck,
-};
+use crate::error::AppError;
+use crate::service::{CallContext, CallError, RateSnapshot};
 use crate::types::domain::Fact;
 use crate::types::envelope::{Meta, Success};
-use crate::types::job::{JobKind, WorkJob, JobStatus};
-use crate::types::ports::{AuditEntry, MemoryStore, StoreError, WorkQueue};
-use crate::types::scope::{ScopeContext, ScopeRef};
 
 /// `RateLimit-*` header names (lower-case; HTTP/2 normalises anyway).
 const RATELIMIT_LIMIT: &str = "ratelimit-limit";
 const RATELIMIT_REMAINING: &str = "ratelimit-remaining";
 const RATELIMIT_RESET: &str = "ratelimit-reset";
 
-/// The per-request edge pipeline: authentication, authorisation, and rate limiting have already run by
-/// the time it exists. It carries the authenticated context, the route's logical operation name (for
-/// the audit record), and the rate-limit headers to attach to every response.
-struct EdgePipeline {
-    ctx: ScopeContext,
-    operation: &'static str,
-    rate: RateHeaders,
-}
-
-impl EdgePipeline {
-    /// Chain steps 3 + 4: authenticate (C3), authorise the route's operation class, and decrement the
-    /// rate-limit bucket. On any failure returns the fully-formed error `Response` (with `RateLimit-*`
-    /// and, on 429, `Retry-After`), so the caller returns it directly. No audit row is written for an
-    /// auth/scope/rate failure (the spec only audits authenticated routes after the response is decided
-    /// — and a missing-token 401 explicitly writes no audit row, per the Gherkin).
-    async fn begin(
-        state: &AppState,
-        headers: &HeaderMap,
-        correlation_id: &str,
-        operation: &'static str,
-        op: Op,
-        class: OpClass,
-    ) -> Result<EdgePipeline, Response> {
-        // Step 3 — authenticate. Pull the bearer token from the Authorization header.
-        let bearer = bearer_token(headers);
-        let ctx = match state.auth.validate(&bearer, correlation_id).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                let app = match e {
-                    crate::auth::AuthError::MissingToken => {
-                        AppError::Unauthenticated(AuthKind::Missing, String::new())
-                    }
-                    crate::auth::AuthError::InvalidToken(detail) => {
-                        AppError::Unauthenticated(AuthKind::Invalid, detail)
-                    }
-                    // validate() never returns InsufficientScope; treat defensively as invalid.
-                    crate::auth::AuthError::InsufficientScope(_) => {
-                        AppError::Unauthenticated(AuthKind::Invalid, String::new())
-                    }
-                };
-                return Err(error_response(&app, correlation_id, state.env()));
-            }
-        };
-
-        // Step 3 (cont.) — authorise the route's operation class against the token scopes.
-        if let Err(crate::auth::AuthError::InsufficientScope(_)) =
-            Authenticator::authorise(&ctx, op)
-        {
-            let app = AppError::InsufficientScope(format!("{op:?}"));
-            return Err(error_response(&app, correlation_id, state.env()));
-        }
-
-        // Step 4 — rate limit, keyed by (subject, op-class).
-        let rate = decrement_rate(state, &ctx.user, class).await;
-        let rate = match rate {
-            Ok(h) => h,
-            Err(h) => {
-                let mut resp =
-                    error_response(&AppError::RateLimited, correlation_id, state.env());
-                attach_rate_headers(&mut resp, &h, true);
-                return Err(resp);
-            }
-        };
-
-        Ok(EdgePipeline {
-            ctx,
-            operation,
-            rate,
-        })
-    }
-
-    /// Finish a successful response: serialise the `Success<T>` body, attach the `RateLimit-*` headers,
-    /// then write the audit record (chain step 8) before returning. An audit-write failure turns the
-    /// success into a `503 STORE_UNAVAILABLE` (the call is not reported successful if it could not be
-    /// audited).
-    async fn finish_success<T: Serialize>(
-        self,
-        state: &AppState,
-        status: StatusCode,
-        body: Success<T>,
-        extra_headers: Vec<(HeaderName, HeaderValue)>,
-    ) -> Response {
-        let correlation_id = self.ctx.correlation_id.clone();
-        if let Err(e) = self.write_audit(state, "success").await {
-            return error_response(&AppError::Store(e), &correlation_id, state.env());
-        }
-        let mut resp = (status, Json(body)).into_response();
-        attach_rate_headers(&mut resp, &self.rate, false);
-        set_correlation_header(&mut resp, &correlation_id);
-        for (name, value) in extra_headers {
-            resp.headers_mut().insert(name, value);
-        }
-        resp
-    }
-
-    /// Finish an error response after auth succeeded: write the audit record with the error `code` as
-    /// the outcome, then return the X1 error envelope with the rate-limit headers attached.
-    async fn finish_error(self, state: &AppState, err: AppError) -> Response {
-        let correlation_id = self.ctx.correlation_id.clone();
-        let (_, envelope) = crate::error::map_error(&err, &correlation_id, state.env());
-        let code = envelope.error.code.clone();
-        // Best-effort audit of the failed outcome; an audit failure is itself a store error, but the
-        // handler already failed, so surface the original error's envelope (do not mask it).
-        let _ = self.write_audit(state, &code).await;
-        let mut resp = error_response(&err, &correlation_id, state.env());
-        attach_rate_headers(&mut resp, &self.rate, false);
-        resp
-    }
-
-    /// Chain step 8 — write one append-only audit record to the per-tenant `audit_log` table. Never
-    /// contains the token, request body, or fact content.
-    async fn write_audit(&self, state: &AppState, outcome: &str) -> Result<(), StoreError> {
-        let entry = AuditEntry {
-            id: format!("audit_log:{}", Uuid::now_v7()),
-            tenant: self.ctx.tenant.clone(),
-            subject: self.ctx.user.clone(),
-            operation: self.operation.to_string(),
-            scope: ScopeRef::from(&self.ctx),
-            outcome: outcome.to_string(),
-            token_jti: self.ctx.token_jti.clone(),
-            correlation_id: self.ctx.correlation_id.clone(),
-            at: Utc::now(),
-        };
-        state.store.append_audit(&entry).await
-    }
-}
-
-/// Build a `ScopeRef` from an authenticated context: the team is the first team membership (or none).
-impl From<&ScopeContext> for ScopeRef {
-    fn from(ctx: &ScopeContext) -> Self {
-        ScopeRef {
-            tenant: ctx.tenant.clone(),
-            team: ctx.teams.first().cloned(),
-            user: ctx.user.clone(),
-        }
-    }
-}
+// --- Transport helpers ---------------------------------------------------------------------------
 
 /// Extract the bearer token value (after "Bearer ") from the Authorization header, or "" when absent.
 fn bearer_token(headers: &HeaderMap) -> String {
@@ -188,26 +46,30 @@ fn bearer_token(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Decrement the `(subject, class)` token bucket, creating a full bucket on first use. Returns the
-/// rate headers (`Ok` allowed, `Err` rejected).
-async fn decrement_rate(
-    state: &AppState,
-    user: &str,
-    class: OpClass,
-) -> Result<RateHeaders, RateHeaders> {
-    let (per_min, burst) = match class {
-        OpClass::Read => (state.config.rate_read_per_min, READ_BURST),
-        OpClass::Write => (state.config.rate_write_per_min, WRITE_BURST),
-    };
-    let mut map = state.rate.lock().await;
-    let bucket = map
-        .entry((user.to_string(), class))
-        .or_insert_with(|| TokenBucket::new(burst, per_min));
-    bucket.take(std::time::Instant::now())
+/// Read the `Idempotency-Key` header value (raw; the Service validates presence/length).
+fn idempotency_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Read the correlation id from request extensions (the middleware always sets it); else honour a valid
+/// inbound header, else mint.
+fn correlation_id(headers: &HeaderMap, ext: Option<&CorrelationId>, state: &AppState) -> String {
+    if let Some(c) = ext {
+        return c.0.clone();
+    }
+    headers
+        .get(CORRELATION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| Uuid::parse_str(s).is_ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| state.new_correlation_id())
 }
 
 /// Attach the `RateLimit-*` headers (and, when `rejected`, `Retry-After`) to a response.
-fn attach_rate_headers(resp: &mut Response, rate: &RateHeaders, rejected: bool) {
+fn attach_rate_headers(resp: &mut Response, rate: &RateSnapshot, rejected: bool) {
     let h = resp.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&rate.limit.to_string()) {
         h.insert(HeaderName::from_static(RATELIMIT_LIMIT), v);
@@ -232,90 +94,35 @@ fn set_correlation_header(resp: &mut Response, correlation_id: &str) {
     }
 }
 
-/// Read the correlation id from request extensions (the middleware always sets it).
-fn correlation_id(headers: &HeaderMap, ext: Option<&CorrelationId>, state: &AppState) -> String {
-    if let Some(c) = ext {
-        return c.0.clone();
+/// Render a [`CallError`] to the X1 error envelope response: the mapped status + envelope, plus the
+/// rate-limit headers when the Service produced a snapshot (a 429 also gets `Retry-After`). A
+/// pre-rate-limit failure (401/403) carries no snapshot and so no `RateLimit-*` headers, matching the
+/// former C8 `begin` behaviour.
+fn render_error(state: &AppState, correlation_id: &str, err: CallError) -> Response {
+    let mut resp = error_response(&err.error, correlation_id, state.env());
+    if let Some(rate) = &err.rate {
+        let rejected = matches!(err.error, AppError::RateLimited);
+        attach_rate_headers(&mut resp, rate, rejected);
     }
-    // Fallback: honour a valid inbound header, else mint.
-    headers
-        .get(CORRELATION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| Uuid::parse_str(s).is_ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| state.new_correlation_id())
+    resp
 }
 
-// --- Idempotency helpers (chain step 5, writes only) ---------------------------------------------
-
-/// Read + validate the `Idempotency-Key` header for a write route: present, non-empty, 1..=255 chars.
-fn idempotency_key(headers: &HeaderMap) -> Result<String, AppError> {
-    let key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_default();
-    if key.is_empty() || key.chars().count() > 255 {
-        return Err(AppError::Validation(
-            ValidationKind::MissingIdempotencyKey,
-            "Idempotency-Key header is required for writes".into(),
-        ));
-    }
-    Ok(key)
-}
-
-/// Look up a stored idempotency outcome for a write route. On a hit, returns the replayed `Response`
-/// (the original status + stored body verbatim, with rate headers + correlation id). On a miss returns
-/// `Ok(None)`. A store error is surfaced as the mapped error response.
-async fn idempotency_replay(
-    state: &AppState,
-    pipe: &EdgePipeline,
-    route: &str,
-    key: &str,
-) -> Result<Option<Response>, Response> {
-    match state
-        .store
-        .idempotency_get(&pipe.ctx.tenant, &pipe.ctx.user, route, key)
-        .await
-    {
-        Ok(Some((status, body))) => {
-            let status = StatusCode::from_u16(status as u16).unwrap_or(StatusCode::OK);
-            let mut resp = (status, Json(body)).into_response();
-            attach_rate_headers(&mut resp, &pipe.rate, false);
-            set_correlation_header(&mut resp, &pipe.ctx.correlation_id);
-            Ok(Some(resp))
-        }
-        Ok(None) => Ok(None),
-        Err(e) => Err(error_response(
-            &AppError::Store(e),
-            &pipe.ctx.correlation_id,
-            state.env(),
-        )),
-    }
-}
-
-/// Persist a write route's produced outcome under the idempotency key (TTL = `RECALL_IDEMPOTENCY_TTL_SECS`).
-async fn idempotency_persist(
-    state: &AppState,
-    pipe: &EdgePipeline,
-    route: &str,
-    key: &str,
+/// Render a `Success<T>` envelope response with the given status, attaching the rate snapshot's
+/// `RateLimit-*` headers, the `X-Correlation-Id`, and any extra headers (e.g. `ETag`).
+fn render_success<T: Serialize>(
     status: StatusCode,
-    body: &Value,
-) -> Result<(), AppError> {
-    state
-        .store
-        .idempotency_put(
-            &pipe.ctx.tenant,
-            &pipe.ctx.user,
-            route,
-            key,
-            i64::from(status.as_u16()),
-            body,
-            state.config.idempotency_ttl_secs,
-        )
-        .await
-        .map_err(AppError::Store)
+    correlation_id: &str,
+    rate: &RateSnapshot,
+    body: Success<T>,
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
+) -> Response {
+    let mut resp = (status, Json(body)).into_response();
+    attach_rate_headers(&mut resp, rate, false);
+    set_correlation_header(&mut resp, correlation_id);
+    for (name, value) in extra_headers {
+        resp.headers_mut().insert(name, value);
+    }
+    resp
 }
 
 // --- Handlers ------------------------------------------------------------------------------------
@@ -327,45 +134,29 @@ pub async fn capabilities(
     ext: Option<axum::Extension<CorrelationId>>,
 ) -> Response {
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe = match EdgePipeline::begin(
-        &state,
-        &headers,
-        &cid,
-        "capabilities",
-        Op::Read,
-        OpClass::Read,
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    let bearer = bearer_token(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: None,
     };
-
-    let openapi_url = format!("http://{}/openapi.json", state.config.http_addr);
-    let caps = Capabilities {
-        service: "recall".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        operations: vec![
-            "recall".into(),
-            "remember".into(),
-            "get_fact".into(),
-            "retire".into(),
-            "delete".into(),
-            "capabilities".into(),
-        ],
-        openapi: openapi_url,
-    };
-    let body = Success {
-        data: caps,
-        meta: Meta {
-            correlation_id: cid.clone(),
-            ..Default::default()
-        },
-    };
-    pipe.finish_success(&state, StatusCode::OK, body, vec![]).await
+    match state.service().capabilities(cx).await {
+        Ok(result) => {
+            let body = Success {
+                data: result.data,
+                meta: Meta {
+                    correlation_id: cid.clone(),
+                    ..Default::default()
+                },
+            };
+            render_success(StatusCode::OK, &cid, &result.rate, body, vec![])
+        }
+        Err(e) => render_error(&state, &cid, e),
+    }
 }
 
-/// `POST /v1/recall` — read. Delegates to C6.
+/// `POST /v1/recall` — read. Delegates to C6 via the Service. The raw body is passed through so the
+/// Service runs auth/authorise/rate ahead of body deserialisation (preserving the C8 ordering).
 pub async fn recall(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -373,37 +164,15 @@ pub async fn recall(
     raw: Bytes,
 ) -> Response {
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe = match EdgePipeline::begin(&state, &headers, &cid, "recall", Op::Read, OpClass::Read)
-        .await
-    {
-        Ok(p) => p,
-        Err(resp) => return resp,
+    let bearer = bearer_token(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: None,
     };
-
-    // Deserialise the body; a malformed body is VAL_INVALID_BODY.
-    let req: RecallRequest = match serde_json::from_slice(&raw) {
-        Ok(r) => r,
-        Err(_) => {
-            return pipe
-                .finish_error(
-                    &state,
-                    AppError::Validation(ValidationKind::InvalidBody, "recall body".into()),
-                )
-                .await;
-        }
-    };
-    // result_cap range [1,50] (the edge enforces the range; C6 enforces the hard max).
-    if req.result_cap < 1 || req.result_cap > 50 {
-        return pipe
-            .finish_error(
-                &state,
-                AppError::Validation(ValidationKind::OutOfRange, "result_cap".into()),
-            )
-            .await;
-    }
-
-    match state.engine.recall(&pipe.ctx, &req).await {
-        Ok(outcome) => {
+    match state.service().recall(cx, &raw).await {
+        Ok(result) => {
+            let outcome = result.data;
             let body = Success {
                 data: outcome.response,
                 meta: Meta {
@@ -412,129 +181,44 @@ pub async fn recall(
                     correlation_id: cid.clone(),
                 },
             };
-            pipe.finish_success(&state, StatusCode::OK, body, vec![]).await
+            render_success(StatusCode::OK, &cid, &result.rate, body, vec![])
         }
-        Err(e) => pipe.finish_error(&state, e).await,
+        Err(e) => render_error(&state, &cid, e),
     }
 }
 
-/// `POST /v1/memories` — write (async). Enqueues an `ExtractFact` job on C2, returns 202.
+/// `POST /v1/memories` — write (async). Enqueues an `ExtractFact` job via the Service, returns 202.
 pub async fn remember(
     State(state): State<AppState>,
     headers: HeaderMap,
     ext: Option<axum::Extension<CorrelationId>>,
     raw: Bytes,
 ) -> Response {
-    const ROUTE: &str = "POST /v1/memories";
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe =
-        match EdgePipeline::begin(&state, &headers, &cid, "remember", Op::Write, OpClass::Write)
-            .await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
-    // Chain step 5 — idempotency key required for writes.
-    let key = match idempotency_key(&headers) {
-        Ok(k) => k,
-        Err(e) => return pipe.finish_error(&state, e).await,
+    let bearer = bearer_token(&headers);
+    let idem = idempotency_header(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: idem.as_deref(),
     };
-    // Replay a stored outcome verbatim if present.
-    match idempotency_replay(&state, &pipe, ROUTE, &key).await {
-        Ok(Some(resp)) => return resp,
-        Ok(None) => {}
-        Err(resp) => return resp,
-    }
-
-    // Deserialise the request body (VAL_INVALID_BODY on failure).
-    let req: RememberRequest = match serde_json::from_slice(&raw) {
-        Ok(r) => r,
-        Err(_) => {
-            return pipe
-                .finish_error(
-                    &state,
-                    AppError::Validation(ValidationKind::InvalidBody, "remember body".into()),
-                )
-                .await;
+    match state.service().remember(cx, &raw).await {
+        Ok(result) => {
+            let body = Success {
+                data: result.data,
+                meta: Meta {
+                    correlation_id: cid.clone(),
+                    ..Default::default()
+                },
+            };
+            render_success(StatusCode::ACCEPTED, &cid, &result.rate, body, vec![])
         }
-    };
-
-    // Build and enqueue an ExtractFact WorkJob; C2 assigns id/attempts/status/timestamps.
-    let payload = remember_payload(&req);
-    let job = WorkJob {
-        id: format!("work_job:{}", Uuid::now_v7()),
-        kind: JobKind::ExtractFact,
-        payload,
-        scope: ScopeRef::from(&pipe.ctx),
-        idempotency_key: Some(key.clone()),
-        attempts: 0,
-        status: JobStatus::Pending,
-        not_before: Utc::now(),
-        created_at: Utc::now(),
-        leased_until: None,
-    };
-    let job_id = match state.queue.enqueue(job).await {
-        Ok(id) => id,
-        Err(e) => return pipe.finish_error(&state, AppError::Queue(e)).await,
-    };
-
-    let ack = WriteAck {
-        job_id,
-        status: JobAckStatus::Accepted,
-    };
-    let body = Success {
-        data: ack,
-        meta: Meta {
-            correlation_id: cid.clone(),
-            ..Default::default()
-        },
-    };
-    // Persist the outcome for idempotent replay (status AlreadyAccepted on replay is achieved by
-    // storing the verbatim body; the spec's "already-accepted" status surfaces because the stored body
-    // is replayed — see the note below: we store an AlreadyAccepted-shaped body for replay).
-    let stored_body = success_value_with_status(&cid, &body.data.job_id, JobAckStatus::AlreadyAccepted);
-    if let Err(e) = idempotency_persist(&state, &pipe, ROUTE, &key, StatusCode::ACCEPTED, &stored_body).await
-    {
-        return pipe.finish_error(&state, e).await;
+        Err(e) => render_error(&state, &cid, e),
     }
-    pipe.finish_success(&state, StatusCode::ACCEPTED, body, vec![]).await
 }
 
-/// Build the work-job payload for a remember request: the request serialised as JSON (structured
-/// content + optional source + optional memory_class), validated by the C4 consumer. Content is
-/// agent-asserted; recall performs no LLM extraction (ADR-015).
-fn remember_payload(req: &RememberRequest) -> Value {
-    let mut payload = serde_json::json!({
-        "content": req.content,
-    });
-    if let Some(mc) = &req.memory_class {
-        payload["memory_class"] = serde_json::to_value(mc).unwrap_or(Value::Null);
-    }
-    if let Some(src) = &req.source {
-        let mut s = serde_json::json!({ "origin_ref": src.origin_ref });
-        if let Some(m) = &src.modification_marker {
-            s["modification_marker"] = Value::String(m.clone());
-        }
-        payload["source"] = s;
-    }
-    payload
-}
-
-/// Build the stored idempotency body for a remember replay: the `Success<WriteAck>` shape carrying the
-/// original `job_id` and `status = already-accepted`.
-fn success_value_with_status(cid: &str, job_id: &str, status: JobAckStatus) -> Value {
-    let status_str = match status {
-        JobAckStatus::Accepted => "accepted",
-        JobAckStatus::AlreadyAccepted => "already-accepted",
-    };
-    serde_json::json!({
-        "data": { "job_id": job_id, "status": status_str },
-        "meta": { "correlation_id": cid }
-    })
-}
-
-/// `GET /v1/memories/{id}` — read. Honours `If-None-Match` / `If-Modified-Since` (→ 304).
+/// `GET /v1/memories/{id}` — read. Honours `If-None-Match` / `If-Modified-Since` (→ 304). The
+/// conditional-GET logic lives here; the Service returns the full `Fact`.
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -542,33 +226,29 @@ pub async fn get_memory(
     ext: Option<axum::Extension<CorrelationId>>,
 ) -> Response {
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe =
-        match EdgePipeline::begin(&state, &headers, &cid, "get_fact", Op::Read, OpClass::Read).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
-    let fact = match state.store.get_fact(&pipe.ctx, &id).await {
-        Ok(Some(f)) => f,
-        Ok(None) => return pipe.finish_error(&state, AppError::NotFound).await,
-        Err(e) => return pipe.finish_error(&state, AppError::Store(e)).await,
+    let bearer = bearer_token(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: None,
     };
+
+    let result = match state.service().get_fact(cx, &id).await {
+        Ok(r) => r,
+        Err(e) => return render_error(&state, &cid, e),
+    };
+    let fact = result.data;
 
     let etag = compute_etag(&fact);
     // Conditional GET: 304 when If-None-Match matches the ETag, or If-Modified-Since >= ingested_at.
     if not_modified(&headers, &etag, fact.ingested_at) {
-        // A 304 carries no envelope body and is still audited as a success.
-        let correlation = pipe.ctx.correlation_id.clone();
-        if let Err(e) = pipe.write_audit(&state, "success").await {
-            return error_response(&AppError::Store(e), &correlation, state.env());
-        }
+        // A 304 carries no envelope body. The success audit already ran inside the Service's get_fact.
         let mut resp = StatusCode::NOT_MODIFIED.into_response();
         if let Ok(v) = HeaderValue::from_str(&etag) {
             resp.headers_mut().insert(ETAG, v);
         }
-        attach_rate_headers(&mut resp, &pipe.rate, false);
-        set_correlation_header(&mut resp, &correlation);
+        attach_rate_headers(&mut resp, &result.rate, false);
+        set_correlation_header(&mut resp, &cid);
         return resp;
     }
 
@@ -580,13 +260,13 @@ pub async fn get_memory(
         },
     };
     let etag_header = HeaderValue::from_str(&etag).ok().map(|v| (ETAG, v));
-    pipe.finish_success(
-        &state,
+    render_success(
         StatusCode::OK,
+        &cid,
+        &result.rate,
         body,
         etag_header.into_iter().collect(),
     )
-    .await
 }
 
 /// Compute the ETag for a fact: a quoted hash derived from its `id` and `ingested_at` (C8 Public
@@ -623,143 +303,95 @@ fn not_modified(headers: &HeaderMap, etag: &str, ingested_at: DateTime<Utc>) -> 
     false
 }
 
-/// `POST /v1/memories/{id}/retire` — forget (non-destructive). Calls C1 `end_validity`.
+/// `POST /v1/memories/{id}/retire` — forget (non-destructive). Calls C1 `end_validity` via the Service.
 pub async fn retire_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     ext: Option<axum::Extension<CorrelationId>>,
 ) -> Response {
-    const ROUTE: &str = "POST /v1/memories/{id}/retire";
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe =
-        match EdgePipeline::begin(&state, &headers, &cid, "retire", Op::Forget, OpClass::Write).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
-    let key = match idempotency_key(&headers) {
-        Ok(k) => k,
-        Err(e) => return pipe.finish_error(&state, e).await,
+    let bearer = bearer_token(&headers);
+    let idem = idempotency_header(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: idem.as_deref(),
     };
-    match idempotency_replay(&state, &pipe, ROUTE, &key).await {
-        Ok(Some(resp)) => return resp,
-        Ok(None) => {}
-        Err(resp) => return resp,
-    }
 
-    let now = Utc::now();
-    match state.store.end_validity(&pipe.ctx, &id, now).await {
-        Ok(()) => {}
-        Err(StoreError::NotFound) => {
-            return pipe.finish_error(&state, AppError::NotFound).await
+    match state.service().retire(cx, &id).await {
+        Ok(result) => {
+            let body = Success {
+                data: result.data,
+                meta: Meta {
+                    correlation_id: cid.clone(),
+                    ..Default::default()
+                },
+            };
+            render_success(StatusCode::OK, &cid, &result.rate, body, vec![])
         }
-        Err(e) => return pipe.finish_error(&state, AppError::Store(e)).await,
+        Err(e) => render_error(&state, &cid, e),
     }
-
-    let ack = RetireAck {
-        record_id: id.clone(),
-        retired_at: now,
-    };
-    let body = Success {
-        data: ack,
-        meta: Meta {
-            correlation_id: cid.clone(),
-            ..Default::default()
-        },
-    };
-    let stored = serde_json::json!({
-        "data": { "record_id": id, "retired_at": now.to_rfc3339() },
-        "meta": { "correlation_id": cid }
-    });
-    if let Err(e) = idempotency_persist(&state, &pipe, ROUTE, &key, StatusCode::OK, &stored).await {
-        return pipe.finish_error(&state, e).await;
-    }
-    pipe.finish_success(&state, StatusCode::OK, body, vec![]).await
 }
 
-/// `DELETE /v1/memories/{id}` — forget (verifiable hard delete). Calls C1 `hard_delete` directly and
-/// returns the `DeletionProof`.
-///
-/// DEVIATION (documented follow-up): the spec describes enqueuing a `HardDelete` job on C2 and blocking
-/// up to 30 s on a C1 job-result read for the proof. There is no job-result store for the edge to await,
-/// and C7's `handle_hard_delete` itself just calls `store.hard_delete`; calling it directly here is
-/// functionally identical, preserves SA-DELETE-01 (never report completion without the proof), and
-/// satisfies the route contract. A `StoreError::NotFound` is a 404; other store errors map per X1.
+/// `DELETE /v1/memories/{id}` — forget (verifiable hard delete). Calls C1 `hard_delete` directly via
+/// the Service and returns the `DeletionProof`.
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     ext: Option<axum::Extension<CorrelationId>>,
 ) -> Response {
-    const ROUTE: &str = "DELETE /v1/memories/{id}";
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe =
-        match EdgePipeline::begin(&state, &headers, &cid, "delete", Op::Forget, OpClass::Write).await
-        {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
-    let key = match idempotency_key(&headers) {
-        Ok(k) => k,
-        Err(e) => return pipe.finish_error(&state, e).await,
+    let bearer = bearer_token(&headers);
+    let idem = idempotency_header(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: idem.as_deref(),
     };
-    match idempotency_replay(&state, &pipe, ROUTE, &key).await {
-        Ok(Some(resp)) => return resp,
-        Ok(None) => {}
-        Err(resp) => return resp,
+
+    match state.service().delete(cx, &id).await {
+        Ok(result) => {
+            let body = Success {
+                data: result.data,
+                meta: Meta {
+                    correlation_id: cid.clone(),
+                    ..Default::default()
+                },
+            };
+            render_success(StatusCode::OK, &cid, &result.rate, body, vec![])
+        }
+        Err(e) => render_error(&state, &cid, e),
     }
-
-    let proof = match state.store.hard_delete(&pipe.ctx, &id).await {
-        Ok(p) => p,
-        Err(StoreError::NotFound) => return pipe.finish_error(&state, AppError::NotFound).await,
-        Err(e) => return pipe.finish_error(&state, AppError::Store(e)).await,
-    };
-
-    let stored = serde_json::json!({
-        "data": serde_json::to_value(&proof).unwrap_or(Value::Null),
-        "meta": { "correlation_id": cid }
-    });
-    let body = Success {
-        data: proof,
-        meta: Meta {
-            correlation_id: cid.clone(),
-            ..Default::default()
-        },
-    };
-    if let Err(e) = idempotency_persist(&state, &pipe, ROUTE, &key, StatusCode::OK, &stored).await {
-        return pipe.finish_error(&state, e).await;
-    }
-    pipe.finish_success(&state, StatusCode::OK, body, vec![]).await
 }
 
 /// `GET /openapi.json` — the generated contract document (not envelope-wrapped). Read class; requires a
-/// valid token (it sits under the authenticated surface, exposing contract data not fact data).
+/// valid token (it sits under the authenticated surface, exposing contract data not fact data). Auth,
+/// rate-limit, and the audit write run in the Service (operation "openapi").
 pub async fn openapi_doc(
     State(state): State<AppState>,
     headers: HeaderMap,
     ext: Option<axum::Extension<CorrelationId>>,
 ) -> Response {
     let cid = correlation_id(&headers, ext.as_deref(), &state);
-    let pipe =
-        match EdgePipeline::begin(&state, &headers, &cid, "openapi", Op::Read, OpClass::Read).await {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
+    let bearer = bearer_token(&headers);
+    let cx = CallContext {
+        bearer: &bearer,
+        correlation_id: &cid,
+        idempotency_key: None,
+    };
 
-    // Audit before flushing, like every authenticated route.
-    let correlation = pipe.ctx.correlation_id.clone();
-    if let Err(e) = pipe.write_audit(&state, "success").await {
-        return error_response(&AppError::Store(e), &correlation, state.env());
-    }
+    let result = match state.service().openapi(cx).await {
+        Ok(r) => r,
+        Err(e) => return render_error(&state, &cid, e),
+    };
     let doc = crate::api::openapi::document("recall", env!("CARGO_PKG_VERSION"));
     let mut resp = (StatusCode::OK, Json(doc)).into_response();
     resp.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    attach_rate_headers(&mut resp, &pipe.rate, false);
-    set_correlation_header(&mut resp, &correlation);
+    attach_rate_headers(&mut resp, &result.rate, false);
+    set_correlation_header(&mut resp, &cid);
     resp
 }
 
@@ -840,31 +472,6 @@ mod tests {
             HeaderValue::from_static("2025-01-01T00:00:00.000Z"),
         );
         assert!(!not_modified(&older, &etag, f.ingested_at));
-    }
-
-    #[test]
-    fn missing_idempotency_key_rejected() {
-        let headers = HeaderMap::new();
-        let err = idempotency_key(&headers).unwrap_err();
-        assert!(matches!(
-            err,
-            AppError::Validation(ValidationKind::MissingIdempotencyKey, _)
-        ));
-    }
-
-    #[test]
-    fn over_long_idempotency_key_rejected() {
-        let mut headers = HeaderMap::new();
-        let long = "k".repeat(256);
-        headers.insert("idempotency-key", HeaderValue::from_str(&long).unwrap());
-        assert!(idempotency_key(&headers).is_err());
-    }
-
-    #[test]
-    fn valid_idempotency_key_accepted() {
-        let mut headers = HeaderMap::new();
-        headers.insert("idempotency-key", HeaderValue::from_static("k-001"));
-        assert_eq!(idempotency_key(&headers).unwrap(), "k-001");
     }
 
     #[test]

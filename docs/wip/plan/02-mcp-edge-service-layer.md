@@ -96,6 +96,20 @@ Final black-box gate (the gate `/sync-check` relies on): `cargo build` (both bin
   suggested-command: grep over deployment files; none expected in-repo
   status: open
   added: 2026-06-27
+- id: FU-004
+  title: Reconcile the remember non-object-content rejection (spec says reject; code does not)
+  why: surfaced in apply-phase-1. The C9 spec (components/service-layer.md Internal Logic step 5) says reject a non-object `remember.content` with VAL_INVALID_BODY, but the original C8 handler never enforced this, so the extraction omitted it to stay strictly behaviour-preserving. Either add the check (+ a test) in a later phase or reconcile the spec to match the as-built behaviour (a non-object content currently enqueues). A latent CONTRACT-DRIFT that /sync-check will flag.
+  source: apply-phase-1
+  suggested-command: /sync-check then /apply or /sync-spec for components/service-layer.md
+  status: open
+  added: 2026-06-27
+- id: FU-005
+  title: Confirm the body-bytes signature of Service::{recall,remember} fits the MCP edge cleanly
+  why: surfaced in apply-phase-1. To preserve the original auth-before-parse ordering, Service::recall/remember take the raw body `&[u8]` and deserialise internally (rather than the spec's typed `req` param). The MCP edge (Phase 2) gets tool args as JSON; it must serialise them to bytes to call these methods. Works (auth-before-parse preserved) but verify it reads cleanly when C10 lands; reconcile the C9 spec signature note if needed.
+  source: apply-phase-1
+  suggested-command: revisit during /apply phase 2
+  status: open
+  added: 2026-06-27
 ```
 
 ## Risks (not closed by this plan)

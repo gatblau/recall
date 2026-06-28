@@ -67,6 +67,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Build a [`Service`](crate::service::Service) over this state's component handles. Cheap — every
+    /// field is `Arc`-backed, so this clones handles, not data. The Service shares the **same** rate
+    /// limiter map as the edge, so a test that seeds an empty bucket through the shared `rate` Arc is
+    /// observed by the Service's rate check. The single definition of the auth/scope/rate/idempotency/
+    /// audit chain lives in the Service (ADR-016); the handlers are thin adapters over it.
+    pub fn service(&self) -> crate::service::Service {
+        crate::service::Service::new(
+            self.config.clone(),
+            self.metrics.clone(),
+            self.store.clone(),
+            self.queue.clone(),
+            self.engine.clone(),
+            self.auth.clone(),
+            self.rate.clone(),
+        )
+    }
+
     /// Mint a fresh correlation id (UUID v4). Used by handlers reached without a middleware-assigned id.
     pub fn new_correlation_id(&self) -> String {
         Uuid::new_v4().to_string()

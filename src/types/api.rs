@@ -80,14 +80,16 @@ pub struct SourceInput {
 }
 
 /// Async (ADR-004).
-#[derive(Serialize)]
+// `Deserialize` is derived alongside `Serialize` so the Service Layer (C9) can round-trip the stored
+// idempotency body back into the typed payload on a replay; the wire shape is unchanged.
+#[derive(Serialize, Deserialize)]
 pub struct WriteAck {
     pub job_id: String,
     pub status: JobAckStatus,
 }
 
 /// AlreadyAccepted => idempotent replay.
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 pub enum JobAckStatus {
     Accepted,
@@ -96,7 +98,7 @@ pub enum JobAckStatus {
 
 /// Acknowledgement returned by `POST /v1/memories/{id}/retire` (C8). A replay within the idempotency
 /// window returns the original `retired_at`.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RetireAck {
     pub record_id: String,
     pub retired_at: DateTime<Utc>,
@@ -111,7 +113,7 @@ pub struct Capabilities {
     pub openapi: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DeletionProof {
     pub deleted_at: DateTime<Utc>,
     pub record_id: String,

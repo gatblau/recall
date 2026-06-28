@@ -13,6 +13,7 @@ pub mod obs;
 pub mod providers;
 pub mod queue;
 pub mod retrieval;
+pub mod service;
 pub mod shutdown;
 pub mod store;
 pub mod types;
