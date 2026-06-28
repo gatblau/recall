@@ -103,6 +103,10 @@ pub struct Config {
     // --- C1 store ---
     pub store_path: String,
     pub store_remote_url: Option<String>,
+    /// Root username for a secured remote store; signin fires only when both user and pass are set (FU-019).
+    pub store_remote_user: Option<String>,
+    /// Root password for a secured remote store (redacted in logs).
+    pub store_remote_pass: Option<Secret>,
     pub store_backend: StoreBackend,
     // --- C3 auth ---
     pub oidc_issuer: String,
@@ -251,6 +255,15 @@ impl Config {
         // --- C1 store ---
         let store_path = src.get_or("RECALL_STORE_PATH", "./data/recall.db");
         let store_remote_url = src.get("RECALL_STORE_REMOTE_URL");
+        let store_remote_user = src.get("RECALL_STORE_REMOTE_USER");
+        let store_remote_pass = src.get("RECALL_STORE_REMOTE_PASS").map(Secret::new);
+        // Both-or-neither (FU-019): a half-set credential is a misconfiguration, never a silent
+        // unauthenticated connect to a server the operator believes is secured.
+        if store_remote_user.is_some() != store_remote_pass.is_some() {
+            return Err(ConfigError::Invalid(
+                "RECALL_STORE_REMOTE_USER/RECALL_STORE_REMOTE_PASS".into(),
+            ));
+        }
         let store_backend = match src.get_or("RECALL_STORE_BACKEND", "surrealkv").as_str() {
             "surrealkv" => StoreBackend::SurrealKv,
             "rocksdb" => StoreBackend::Rocksdb,
@@ -400,6 +413,8 @@ impl Config {
             mcp_path,
             store_path,
             store_remote_url,
+            store_remote_user,
+            store_remote_pass,
             store_backend,
             oidc_issuer,
             oidc_audience,

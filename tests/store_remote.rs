@@ -16,6 +16,8 @@ use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
+mod support;
+
 /// The pinned SurrealDB server image tag (3.x), matching the embedded `surrealdb` crate major.
 const SURREALDB_IMAGE: &str = "surrealdb/surrealdb";
 const SURREALDB_TAG: &str = "v3.1.5";
@@ -131,4 +133,93 @@ async fn connect_with_retry(
         }
     }
     Err(last_err.expect("at least one connection attempt"))
+}
+
+/// FU-019 — `Store::connect` signs in to a SECURED remote SurrealDB when credentials are configured,
+/// and a credential-less connect against the same secured server cannot run privileged statements.
+///
+/// One authenticated server, two `Store::connect` calls:
+///   * with `RECALL_STORE_REMOTE_USER`/`_PASS` → the session is authenticated, DDL+DML round-trips;
+///   * without them → connect succeeds (no signin) but a privileged statement is rejected.
+#[tokio::test]
+async fn store_connect_signs_in_to_a_secured_server() {
+    // Authenticated server: root/root, in-memory.
+    let image = GenericImage::new(SURREALDB_IMAGE, SURREALDB_TAG)
+        .with_exposed_port(8000.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Started web server"))
+        .with_cmd([
+            "start", "--user", "root", "--pass", "root", "--bind", "0.0.0.0:8000", "memory",
+        ]);
+    let container = match image.start().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP store_connect_signs_in_to_a_secured_server: could not start SurrealDB ({e}); docker may be absent");
+            return;
+        }
+    };
+    let host_port = match container.get_host_port_ipv4(8000).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("SKIP store_connect_signs_in_to_a_secured_server: no host port ({e})");
+            return;
+        }
+    };
+    let ws_url = format!("ws://127.0.0.1:{host_port}");
+
+    // --- POSITIVE: creds configured → Store::connect signs in → DDL+DML round-trips ---------------
+    let mut m = support::minimal_env();
+    m.insert("RECALL_STORE_REMOTE_URL".into(), ws_url.clone());
+    m.insert("RECALL_STORE_REMOTE_USER".into(), "root".into());
+    m.insert("RECALL_STORE_REMOTE_PASS".into(), "root".into());
+    m.insert("RECALL_EMBED_DIM".into(), "8".into());
+    let cfg = support::config_from_map(&m);
+
+    let store = recall::store::Store::connect(&cfg)
+        .await
+        .expect("Store::connect should sign in to the secured server with valid creds");
+    let db = store.handle();
+    db.query("DEFINE NAMESPACE IF NOT EXISTS acme")
+        .await
+        .expect("define ns over the authenticated session")
+        .check()
+        .expect("ns ddl ok (authenticated)");
+    db.use_ns("acme").use_db("recall").await.expect("use ns/db");
+    db.query("DEFINE TABLE IF NOT EXISTS fact SCHEMALESS; CREATE fact:rt SET confidence = 0.9")
+        .await
+        .expect("ddl + create over the authenticated session")
+        .check()
+        .expect("create ok (authenticated)");
+    let mut resp = db
+        .query("SELECT confidence FROM fact:rt")
+        .await
+        .expect("select over the authenticated session");
+    let rows: Vec<Json> = resp.take(0).expect("take rows");
+    assert_eq!(rows.len(), 1, "the credentialed session round-trips a record");
+    assert_eq!(
+        rows[0].get("confidence").and_then(|v| v.as_f64()),
+        Some(0.9),
+        "value round-trips over the authenticated remote connection"
+    );
+
+    // --- NEGATIVE: no creds → Store::connect (no signin) → privileged statement is rejected -------
+    let mut m2 = support::minimal_env();
+    m2.insert("RECALL_STORE_REMOTE_URL".into(), ws_url.clone());
+    m2.insert("RECALL_EMBED_DIM".into(), "8".into());
+    let cfg2 = support::config_from_map(&m2);
+
+    let store2 = recall::store::Store::connect(&cfg2)
+        .await
+        .expect("connect itself succeeds without creds (no signin attempted)");
+    let db2 = store2.handle();
+    // A root-level statement on an unauthenticated session against a secured server must be rejected.
+    let unauth = db2
+        .query("DEFINE NAMESPACE IF NOT EXISTS globex")
+        .await
+        .and_then(|mut r| r.take::<Vec<Json>>(0).map(|_| ()));
+    assert!(
+        unauth.is_err(),
+        "a secured server must reject privileged DDL on an unauthenticated session (proves signin is required)"
+    );
+
+    eprintln!("store_connect_signs_in_to_a_secured_server: signin verified against {SURREALDB_IMAGE}:{SURREALDB_TAG}");
 }

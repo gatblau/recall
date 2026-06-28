@@ -204,6 +204,8 @@ pub trait MemoryStore: Send + Sync {                 // impl: embedded SurrealDB
 |---|---|---|---|---|
 | `RECALL_STORE_PATH` | path | `./data/recall.db` | no | Embedded SurrealDB data directory (SurrealKV/RocksDB). |
 | `RECALL_STORE_REMOTE_URL` | url | _(unset)_ | no | If set, target a remote SurrealDB/TiKV cluster instead of embedding (ADR-009 scale-out). |
+| `RECALL_STORE_REMOTE_USER` | string | _(unset)_ | no | Root username for a **secured** remote store; signin fires only when both user and pass are set (FU-019). Exactly one of user/pass set fails startup. |
+| `RECALL_STORE_REMOTE_PASS` | secret | _(unset)_ | no | Root password for a secured remote store (env only, redacted in logs). |
 | `RECALL_STORE_BACKEND` | enum `surrealkv\|rocksdb` | `surrealkv` | no | Embedded storage backend. |
 | `RECALL_EMBED_DIM` | u32 | `1024` | no | Embedding dimension; must equal the vector-index dimension (SA-EMBED-01). |
 
@@ -406,8 +408,12 @@ different namespace.
    set — remote wins), otherwise `surrealkv://{RECALL_STORE_PATH}` for the embedded default (in-process
    tests/ephemeral runs use `mem://`). A remote deployment therefore needs no code change. On any
    connection failure return `StoreError::Unavailable`. Log span `store.connect` with field `backend`.
-   *(Residual: a secured remote server needs `signin` credentials, which `connect` does not yet pass —
-   see the plan's remote-auth follow-up.)*
+   When the endpoint is remote **and** both `RECALL_STORE_REMOTE_USER` and `RECALL_STORE_REMOTE_PASS`
+   are set, `connect` calls `db.signin(Root{ username, password })` after the connection opens, so a
+   **secured** remote server is authenticated (FU-019); embedded and no-auth remote endpoints skip
+   signin. `Config` enforces both-or-neither (exactly one set fails startup); the password is a
+   redacted `Secret`. Per-operation `use_ns`/`use_db` (`ensure_and_use`) selects the tenant namespace
+   on the authenticated session, so a root signin at connect is sufficient.
 2. Migrations are applied lazily per tenant through the `Migrator` (see Data Model): every read/write
    method first calls `ensure_and_use(tenant)`, which runs `Migrator::migrate_up(tenant)` (idempotent —
    a no-op once the namespace is at the latest version) then selects the tenant namespace and the

@@ -542,6 +542,8 @@ a missing required value or a failed validation (e.g. embedding-dimension mismat
 | `RECALL_HTTP_ADDR` | socket addr | `0.0.0.0:8080` | no | C8 | Bind address for the HTTP API. |
 | `RECALL_STORE_PATH` | path | `./data/recall.db` | no | C1 | Embedded SurrealDB data directory (SurrealKV/RocksDB). |
 | `RECALL_STORE_REMOTE_URL` | url | _(unset)_ | no | C1 | If set, target a remote SurrealDB/TiKV cluster instead of embedding (ADR-009 scale-out). |
+| `RECALL_STORE_REMOTE_USER` | string | _(unset)_ | no | C1 | Root username for a **secured** remote store; signin fires only when both user and pass are set (FU-019). Setting exactly one of user/pass fails startup. |
+| `RECALL_STORE_REMOTE_PASS` | secret | _(unset)_ | no | C1 | Root password for a secured remote store (env only, redacted in logs). |
 | `RECALL_STORE_BACKEND` | enum `surrealkv\|rocksdb` | `surrealkv` | no | C1 | Embedded storage backend. |
 | `RECALL_OIDC_ISSUER` | url | _(none)_ | **yes** | C3 | OIDC issuer; discovery at `<issuer>/.well-known/openid-configuration`. |
 | `RECALL_OIDC_AUDIENCE` | string | _(none)_ | **yes** | C3 | Expected `aud` claim. |

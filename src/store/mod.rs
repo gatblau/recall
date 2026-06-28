@@ -62,6 +62,19 @@ impl Store {
         let db = surrealdb::engine::any::connect(endpoint)
             .await
             .map_err(map_db_err)?;
+        // Authenticate to a secured remote server (FU-019). Config guarantees both-or-neither, so a
+        // present user implies a present password. Embedded and no-auth remote endpoints skip signin;
+        // per-operation `use_ns`/`use_db` (ensure_and_use) selects the tenant namespace after this.
+        if cfg.store_remote_url.is_some() {
+            if let (Some(user), Some(pass)) = (&cfg.store_remote_user, &cfg.store_remote_pass) {
+                db.signin(surrealdb::opt::auth::Root {
+                    username: user.clone(),
+                    password: pass.expose().to_string(),
+                })
+                .await
+                .map_err(map_db_err)?;
+            }
+        }
         Ok(Self {
             db,
             embed_dim: cfg.embed_dim,
