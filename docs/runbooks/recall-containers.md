@@ -2,7 +2,7 @@
 
 Operational note for running both recall edges locally from the single container image. Covers
 building the image, bringing the stack up, the ports/commands, the required configuration, and the
-two honest caveats (unauthenticated store, placeholder providers).
+one honest caveat (placeholder providers).
 
 ## What this stack runs
 
@@ -13,7 +13,7 @@ shared store and a local OIDC issuer:
 |-------------|-----------------------------|----------------|-----------|-------------------------------|
 | `recall`    | `recall:ci`                 | `recall`       | `8080`    | REST API edge                 |
 | `recall-mcp`| `recall:ci`                 | `recall-mcp`   | `8081`    | MCP edge (JSON-RPC at `/mcp`)  |
-| `surrealdb` | `surrealdb/surrealdb:v3.1.5`| `start … memory` | `8000`  | Shared store (UNAUTHENTICATED) |
+| `surrealdb` | `surrealdb/surrealdb:v3.1.5`| `start --user … --pass … memory` | `8000`  | Shared store (AUTHENTICATED; recall signs in, FU-019) |
 | `dex`       | `dexidp/dex:v2.41.1`        | `dex serve …`  | `35357`   | Local OIDC issuer (token mint) |
 
 Both edges share ONE store (`surrealdb`) so they are genuinely two manifestations of one service: a
@@ -90,15 +90,15 @@ listen addresses need no overriding.
 
 ## Honest caveats
 
-### The shared store is UNAUTHENTICATED (FU-019)
+### The shared store is AUTHENTICATED (FU-019 closed)
 
-`surrealdb` starts with no `--user`/`--pass`, so it grants full access with no sign-in. This is
-required because recall's `Store::connect` does **not** authenticate to the remote store today — the
-FU-019 gap (remote signin). A secured SurrealDB server would reject recall's DDL/DML and the edges
-would fail to boot. An unauthenticated server on a private compose network is acceptable for a local
-single-node stack; it is **not** a production posture. Securing the remote store is the follow-up
-**FU-019 (remote signin)** — once recall signs in, the server can be started with root credentials
-and a scoped database user.
+`surrealdb` starts with root credentials (`--user`/`--pass`, default `root`/`root` for local,
+overridable via a `.env` file). recall's `Store::connect` signs in to the secured store when
+`RECALL_STORE_REMOTE_USER`/`RECALL_STORE_REMOTE_PASS` are set — both edges carry the same pair as the
+`surrealdb` service, so they cannot drift. Setting exactly one of user/pass fails startup
+(both-or-neither). **For production:** supply strong credentials (never the `root`/`root` default) and
+use `wss://` (TLS) to the store; a namespace/database-scoped (non-root) credential is a further
+hardening step (tracked as a follow-up). The earlier unauthenticated-store caveat is resolved.
 
 ### Provider placeholders mean recall/remember is partial
 

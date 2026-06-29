@@ -13,11 +13,12 @@
 #   (`ws://...`). `Store::connect` resolves the `ws://` scheme to the remote engine (src/store/mod.rs),
 #   so the edges open the SAME database.
 #
-#   The SurrealDB server runs UNAUTHENTICATED. recall's `Store::connect` does NOT sign in to the
-#   remote (the FU-019 gap — see docs/runbooks/recall-containers.md), so a secured server would
-#   reject its DDL/DML. An unauthenticated server grants full access and is what works today. This is
-#   acceptable for a local single-node stack on a private compose network; it is NOT a production
-#   posture. Securing the remote store is tracked as FU-019 (remote signin).
+#   The SurrealDB server runs AUTHENTICATED (root creds). recall's `Store::connect` signs in to the
+#   remote when `RECALL_STORE_REMOTE_USER`/`RECALL_STORE_REMOTE_PASS` are set (FU-019, closed), so the
+#   edges authenticate to the secured store. The credentials default to `root`/`root` for a local
+#   stack and are overridable via a `.env` file (`RECALL_STORE_REMOTE_USER`/`_PASS`); the same pair
+#   feeds both the `surreal start` command and the edges, so they cannot drift. For production, supply
+#   strong creds and use `wss://` (TLS) to the store.
 #
 # BOOT ORDERING — recall fail-fasts with NO retry:
 #   `build_state` constructs the C3 Authenticator (OIDC discovery + JWKS fetch) and opens the store,
@@ -42,13 +43,22 @@ services:
       # Host access so an operator can mint a token (ROPC) for manual REST/MCP calls.
       - "35357:5556"
 
-  # --- Shared store (UNAUTHENTICATED — see topology note above) ----------------
+  # --- Shared store (AUTHENTICATED — recall signs in, FU-019) ------------------
   surrealdb:
     image: surrealdb/surrealdb:v3.1.5
-    # No --user/--pass: the server starts unauthenticated (full access), which is what recall's
-    # no-signin Store::connect requires today (FU-019). `memory` keeps the store ephemeral — a fresh
-    # store every `up`; swap to a surrealkv:// path + a named volume for persistence if needed.
-    command: ["start", "--bind", "0.0.0.0:8000", "memory"]
+    # Authenticated root creds (default root/root for local; override via .env). recall's
+    # Store::connect signs in with the matching RECALL_STORE_REMOTE_USER/_PASS below. `memory` keeps
+    # the store ephemeral — a fresh store every `up`; swap to a surrealkv:// path + a named volume for
+    # persistence if needed.
+    command:
+      - "start"
+      - "--user"
+      - "${RECALL_STORE_REMOTE_USER:-root}"
+      - "--pass"
+      - "${RECALL_STORE_REMOTE_PASS:-root}"
+      - "--bind"
+      - "0.0.0.0:8000"
+      - "memory"
     ports:
       - "8000:8000"
 
@@ -64,6 +74,9 @@ services:
       RECALL_OIDC_AUDIENCE: "recall-test"
       # Shared remote store — BOTH edges point here so they share one database.
       RECALL_STORE_REMOTE_URL: "ws://surrealdb:8000"
+      # Sign in to the secured store (FU-019). Same pair as the surrealdb service; override via .env.
+      RECALL_STORE_REMOTE_USER: "${RECALL_STORE_REMOTE_USER:-root}"
+      RECALL_STORE_REMOTE_PASS: "${RECALL_STORE_REMOTE_PASS:-root}"
       # Embedding / reranker providers are OPERATOR-SUPPLIED. The placeholders below let the edge
       # boot and serve discovery/health, but recall/remember will not fully work until real provider
       # endpoints (and their API keys) are set. Replace these with your real provider URLs + keys.
@@ -88,6 +101,9 @@ services:
       RECALL_OIDC_ISSUER: "http://dex:5556/dex"
       RECALL_OIDC_AUDIENCE: "recall-test"
       RECALL_STORE_REMOTE_URL: "ws://surrealdb:8000"
+      # Sign in to the secured store (FU-019). Same pair as the surrealdb service; override via .env.
+      RECALL_STORE_REMOTE_USER: "${RECALL_STORE_REMOTE_USER:-root}"
+      RECALL_STORE_REMOTE_PASS: "${RECALL_STORE_REMOTE_PASS:-root}"
       RECALL_EMBED_URL: "http://embed.invalid"
       RECALL_EMBED_API_KEY: "placeholder-embed-key"
       RECALL_RERANK_URL: "http://rerank.invalid"
